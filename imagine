@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+
+if command -v realpath >/dev/null 2>&1; then
+    SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
+elif command -v readlink >/dev/null 2>&1 && readlink -f / >/dev/null 2>&1; then
+    SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+else
+    SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+fi
+
+BIN_DIR="$(dirname "$SCRIPT_PATH")"
+PREFIX_DIR="$(dirname "$BIN_DIR")"
+SHARE_DIR="$PREFIX_DIR/share/imagine"
+
+if [ ! -d "$SHARE_DIR" ]; then
+    echo "Error: Installation not found at $SHARE_DIR"
+    echo "Please run 'make install'."
+    exit 1
+fi
+
+VENV_DIR="$SHARE_DIR/venv"
+
+if [ -f "$VENV_DIR/bin/activate" ]; then
+    source "$VENV_DIR/bin/activate"
+else
+    echo "Error: Cannot find virtual environment activation script at $VENV_DIR/bin/activate"
+    exit 1
+fi
+
+PYTHON_SCRIPT="$SHARE_DIR/imagine.py"
+
+if [ ! -f "$PYTHON_SCRIPT" ]; then
+    echo "Error: imagine.py not found at $PYTHON_SCRIPT"
+    exit 1
+fi
+
+exec python3 "$PYTHON_SCRIPT" "$@"

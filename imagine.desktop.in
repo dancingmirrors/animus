@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Imagine
+GenericName=Imagine
+Comment=Imagine
+Exec=@BINDIR@/imagine
+Icon=applications-graphics
+Terminal=false
+Categories=Graphics;2DGraphics;RasterGraphics;
+Keywords=image;generator;ai;sdxl;diffusion;
+StartupNotify=true
