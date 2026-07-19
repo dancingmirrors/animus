@@ -1949,6 +1949,8 @@ def main():
     win.connect("delete-event", win.on_window_close)
     win.connect("destroy", Gtk.main_quit)
     win.show_all()
+    win.set_focus(None)
+    win.model_entry.select_region(0, 0)
 
     try:
         Gtk.main()
