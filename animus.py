@@ -26,6 +26,28 @@ from datetime import datetime
 import threading
 import ctypes
 import re
+
+
+def _init_fontconfig():
+    import ctypes
+    import ctypes.util
+
+    for name in (
+        ctypes.util.find_library("fontconfig"),
+        "libfontconfig.so.1",
+        "libfontconfig.so",
+    ):
+        if not name:
+            continue
+        try:
+            ctypes.CDLL(name).FcInit()
+            return
+        except OSError:
+            continue
+
+
+_init_fontconfig()
+
 import gi
 
 gi.require_version("Gtk", "3.0")
