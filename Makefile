@@ -6,16 +6,20 @@ DESKTOPDIR = $(PREFIX)/share/applications
 PYTHON = python3
 VENV_DIR = $(SHAREDIR)/venv
 
-.PHONY: all install uninstall clean help
+TORCH_PREBUILT ?=
+
+.PHONY: all install uninstall clean help torch torch-ensure
 
 all: help
 
 help:
-	@echo "  make install     Install to $(PREFIX)"
+	@echo "  make install     Build torch from source and install to $(PREFIX)"
+	@echo "                   (TORCH_PREBUILT=1 make install uses a prebuilt wheel)"
+	@echo "  make torch       Build a CPU torch wheel from source into wheels/"
 	@echo "  make uninstall   Remove from $(PREFIX)"
 	@echo "  make clean       Clean the virtual environment"
 
-install:
+install: torch-ensure
 	@mkdir -p $(SHAREDIR)
 	@mkdir -p $(BINDIR)
 	@mkdir -p $(DESKTOPDIR)
@@ -35,9 +39,7 @@ install:
 	@if ls wheels/torch-*.whl >/dev/null 2>&1; then \
 		$(VENV_DIR)/bin/pip install wheels/torch-*.whl; \
 	else \
-		$(VENV_DIR)/bin/pip install --index-url https://download.pytorch.org/whl/cpu torch || { \
-		exit 1; \
-		}; \
+		$(VENV_DIR)/bin/pip install --index-url https://download.pytorch.org/whl/cpu torch; \
 	fi
 
 	@$(VENV_DIR)/bin/pip install -r requirements.txt
@@ -45,6 +47,22 @@ install:
 
 	@sed 's|@BINDIR@|$(BINDIR)|g' animus.desktop.in > $(DESKTOPDIR)/animus.desktop
 	@chmod 644 $(DESKTOPDIR)/animus.desktop
+
+torch:
+	@PYTHON="$(PYTHON)" ./build-torch.sh
+
+torch-ensure:
+	@if [ "$(TORCH_PREBUILT)" = "1" ]; then \
+		echo "==> TORCH_PREBUILT=1: will install a prebuilt CPU PyTorch."; \
+	elif [ -d .torch-src/.git ]; then \
+		echo "==> An incremental build of .torch-src..."; \
+		PYTHON="$(PYTHON)" ./build-torch.sh; \
+	elif ls wheels/torch-*.whl >/dev/null 2>&1; then \
+		echo "==> Reusing the existing wheels..."; \
+	else \
+		echo "==> Building CPU PyTorch from source."; \
+		PYTHON="$(PYTHON)" ./build-torch.sh; \
+	fi
 
 uninstall:
 	@rm -f $(BINDIR)/animus

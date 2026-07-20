@@ -7,6 +7,7 @@
 *~
 .DS_Store
 .Python
+.ccache/
 .idea/
 .torch-src/
 .vscode/
