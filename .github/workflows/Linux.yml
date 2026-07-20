@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  install:
+  Linux:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     permissions:
@@ -73,10 +73,10 @@ jobs:
     - name: Verify important imports
       run: |
         source "$HOME/.local/share/animus/venv/bin/activate"
-        python3 -c "import gi; gi.require_version('Gtk', '3.0'); from gi.repository import Gtk, GdkPixbuf, GLib; print('Relevant GTK imports successful!')"
-        python3 -c "from transformers import CLIPTokenizer; print('Relevant transformers import successful!')"
-        python3 -c "from diffusers import ModularPipeline, CosmosTransformer3DModel, GGUFQuantizationConfig; print('Relevant diffusers import successful!')"
-        python3 -c "import torch; print(f'torch import successful, version: {torch.__version__}')"
+        python3 -c "import gi; gi.require_version('Gtk', '3.0'); from gi.repository import Gtk, GdkPixbuf, GLib; print('The relevant GTK imports were successful.')"
+        python3 -c "from transformers import CLIPTokenizer; print('The CLIPTokenizer import was successful.')"
+        python3 -c "from diffusers import ModularPipeline, CosmosTransformer3DModel, GGUFQuantizationConfig; print('The relevant diffusers imports were successful.')"
+        python3 -c "import torch; print(f'The torch import was successful at version {torch.__version__}.')"
 
 
     - name: ccache stats
