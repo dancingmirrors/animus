@@ -65,6 +65,8 @@ try:
         ModularPipeline,
         CosmosTransformer3DModel,
         GGUFQuantizationConfig,
+        FlowMatchEulerDiscreteScheduler,
+        UniPCMultistepScheduler,
     )
 
     ANIMA_AVAILABLE = True
@@ -72,6 +74,8 @@ except Exception:  # pragma: Requires diffusers >= 0.39.0.
     ModularPipeline = None
     CosmosTransformer3DModel = None
     GGUFQuantizationConfig = None
+    FlowMatchEulerDiscreteScheduler = None
+    UniPCMultistepScheduler = None
     ANIMA_AVAILABLE = False
 
 from PIL import Image as _PILImage
@@ -139,6 +143,9 @@ ANIMA_DEFAULT_STEPS = 8
 ANIMA_DEFAULT_GUIDANCE = 1.5
 ANIMA_DEFAULT_SIZE = 512
 
+ANIMA_SAMPLERS = ("Euler", "Euler Ancestral", "UniPC")
+ANIMA_DEFAULT_SAMPLER = "Euler"
+
 # XXX: Real value here?
 ANIMA_TOKEN_LIMIT = 512
 ANIMA_TOKEN_WARNING = 448
@@ -163,6 +170,32 @@ ANIMA_LATENT_RGB_FACTORS = [
     [0.1984, 0.0913, 0.1861],
 ]
 ANIMA_LATENT_RGB_BIAS = [-0.1835, -0.0868, -0.3360]
+
+
+def build_anima_scheduler(sampler, base_scheduler):
+    config = dict(base_scheduler.config)
+
+    if sampler == "Euler Ancestral":
+        return FlowMatchEulerDiscreteScheduler.from_config(
+            config, stochastic_sampling=True
+        )
+
+    if sampler == "UniPC":
+        shift = config.get("shift", 1.0)
+        try:
+            shift = float(shift)
+        except (TypeError, ValueError):
+            shift = 1.0
+        return UniPCMultistepScheduler(
+            num_train_timesteps=int(config.get("num_train_timesteps", 1000)),
+            solver_order=2,
+            prediction_type="flow_prediction",
+            use_flow_sigmas=True,
+            flow_shift=shift,
+        )
+
+    return FlowMatchEulerDiscreteScheduler.from_config(config)
+
 
 _gui_instance = None
 _anima_step_hook = None
@@ -418,6 +451,7 @@ class AnimusGUI(Gtk.Window):
         self.set_border_width(10)
 
         self.pipe = None
+        self._base_scheduler = None
         self.generating = False
         self.loading_model = False
         self.stop_event = threading.Event()
@@ -653,6 +687,20 @@ class AnimusGUI(Gtk.Window):
         self.guidance_spin.set_size_request(100, -1)
         guidance_box.pack_start(self.guidance_spin, False, False, 0)
         controls_box.pack_start(guidance_box, False, False, 0)
+
+        sampler_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        sampler_label = Gtk.Label(label="Sampler:")
+        sampler_label.set_size_request(100, -1)
+        sampler_label.set_xalign(0)
+        sampler_box.pack_start(sampler_label, False, False, 0)
+
+        self.sampler_combo = Gtk.ComboBoxText()
+        for sampler_name in ANIMA_SAMPLERS:
+            self.sampler_combo.append(sampler_name, sampler_name)
+        self.sampler_combo.set_active_id(ANIMA_DEFAULT_SAMPLER)
+
+        sampler_box.pack_start(self.sampler_combo, False, False, 0)
+        controls_box.pack_start(sampler_box, False, False, 0)
 
         preview_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
         preview_label = Gtk.Label(label="Live preview:")
@@ -891,6 +939,8 @@ class AnimusGUI(Gtk.Window):
                     self.steps_spin.set_value(settings["steps"])
                 if "guidance" in settings:
                     self.guidance_spin.set_value(settings["guidance"])
+                if settings.get("sampler") in ANIMA_SAMPLERS:
+                    self.sampler_combo.set_active_id(settings["sampler"])
                 if "width" in settings:
                     self.width_spin.set_value(settings["width"])
                 if "height" in settings:
@@ -948,6 +998,7 @@ class AnimusGUI(Gtk.Window):
                 "loras": [],
                 "steps": int(self.steps_spin.get_value()),
                 "guidance": float(self.guidance_spin.get_value()),
+                "sampler": self.sampler_combo.get_active_id() or ANIMA_DEFAULT_SAMPLER,
                 "width": int(self.width_spin.get_value()),
                 "height": int(self.height_spin.get_value()),
                 "preview": self.preview_check.get_active(),
@@ -1246,6 +1297,7 @@ class AnimusGUI(Gtk.Window):
                 self.update_status("Cleaning up existing model...")
                 del self.pipe
                 self.pipe = None
+                self._base_scheduler = None
                 gc.collect()
 
             if self._check_stop_loading():
@@ -1361,6 +1413,8 @@ class AnimusGUI(Gtk.Window):
             pipe.to("cpu")
         except Exception as e:
             print(f"Warning: could not move pipeline to CPU: {e}.")
+
+        self._base_scheduler = getattr(pipe, "scheduler", None)
 
         gc.collect()
         return pipe
@@ -1726,6 +1780,23 @@ class AnimusGUI(Gtk.Window):
                 print(f"  -> Sending SIGINT to process (PID {os.getpid()}).")
                 os.kill(os.getpid(), signal.SIGINT)
 
+    def _apply_sampler(self, sampler):
+        base = self._base_scheduler or getattr(self.pipe, "scheduler", None)
+        if base is None or self.pipe is None:
+            return
+        try:
+            scheduler = build_anima_scheduler(sampler, base)
+            self.pipe.update_components(scheduler=scheduler)
+        except Exception as e:
+            print(
+                f"Warning: could not select sampler '{sampler}': {e}. "
+                "Falling back to the pipeline default."
+            )
+            try:
+                self.pipe.update_components(scheduler=base)
+            except Exception:
+                pass
+
     def generate_image_thread(self):
         try:
             prompt_buffer = self.prompt_text.get_buffer()
@@ -1758,10 +1829,13 @@ class AnimusGUI(Gtk.Window):
             guidance = float(self.guidance_spin.get_value())
             width = int(self.width_spin.get_value())
             height = int(self.height_spin.get_value())
+            sampler = self.sampler_combo.get_active_id() or ANIMA_DEFAULT_SAMPLER
+
+            self._apply_sampler(sampler)
 
             self.update_status(
-                f"Generating with Anima at {width}x{height} with {steps} steps "
-                f"and guidance {guidance}..."
+                f"Generating with Anima ({sampler}) at {width}x{height} with "
+                f"{steps} steps and guidance {guidance}..."
             )
 
             self.preview_shown = False
@@ -1932,6 +2006,7 @@ class AnimusGUI(Gtk.Window):
         self.height_spin.set_value(ANIMA_DEFAULT_SIZE)
         self.steps_spin.set_value(ANIMA_DEFAULT_STEPS)
         self.guidance_spin.set_value(ANIMA_DEFAULT_GUIDANCE)
+        self.sampler_combo.set_active_id(ANIMA_DEFAULT_SAMPLER)
 
         self.trigger_text.get_buffer().set_text("")
         self.prompt_text.get_buffer().set_text("")
