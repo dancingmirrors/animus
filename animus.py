@@ -1946,7 +1946,7 @@ class AnimusGUI(Gtk.Window):
             self._apply_guidance(guidance)
 
             self.update_status(
-                f"Generating with Anima ({sampler}, shift {shift:g}) at "
+                f"Generating with Anima ({sampler}, shift {shift:.2f}) at "
                 f"{width}x{height} with {steps} steps, guidance {guidance}, "
                 f"and seed {seed}..."
             )
