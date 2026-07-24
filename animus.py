@@ -2098,7 +2098,7 @@ class AnimusGUI(Gtk.Window):
             try:
                 if Path(self.current_image_path).exists():
                     os.remove(self.current_image_path)
-                    print(f"Deleted image: {self.current_image_path}")
+                    print(f"Deleted image: {self.current_image_path}.")
                     self.update_status("Image deleted successfully.")
                 else:
                     print(f"Image file no longer exists: " f"{self.current_image_path}")
