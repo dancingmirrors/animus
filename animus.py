@@ -78,6 +78,14 @@ except Exception:  # pragma: Requires diffusers >= 0.39.0.
     UniPCMultistepScheduler = None
     ANIMA_AVAILABLE = False
 
+try:
+    from diffusers import ClassifierFreeGuidance
+except Exception:
+    try:
+        from diffusers.guiders import ClassifierFreeGuidance
+    except Exception:
+        ClassifierFreeGuidance = None
+
 from PIL import Image as _PILImage
 
 _PILImage.preinit()
@@ -1797,6 +1805,26 @@ class AnimusGUI(Gtk.Window):
             except Exception:
                 pass
 
+    def _apply_guidance(self, guidance):
+        if self.pipe is None:
+            return
+        if ClassifierFreeGuidance is None:
+            # Trouble ahead.
+            return
+        try:
+            self.pipe.update_components(
+                guider=ClassifierFreeGuidance(guidance_scale=float(guidance))
+            )
+            try:
+                active = self.pipe.guider.guidance_scale
+            except Exception:
+                active = guidance
+        except Exception as e:
+            print(
+                f"Warning: could not apply guidance {guidance} to the guider "
+                f"component: {e}. The pipeline's default CFG will be used."
+            )
+
     def generate_image_thread(self):
         try:
             prompt_buffer = self.prompt_text.get_buffer()
@@ -1832,6 +1860,7 @@ class AnimusGUI(Gtk.Window):
             sampler = self.sampler_combo.get_active_id() or ANIMA_DEFAULT_SAMPLER
 
             self._apply_sampler(sampler)
+            self._apply_guidance(guidance)
 
             self.update_status(
                 f"Generating with Anima ({sampler}) at {width}x{height} with "
@@ -1849,7 +1878,6 @@ class AnimusGUI(Gtk.Window):
                     prompt=full_prompt,
                     negative_prompt=negative_prompt,
                     num_inference_steps=steps,
-                    guidance_scale=guidance,
                     width=width,
                     height=height,
                 )
