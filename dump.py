@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 
 import json
+import struct
 import sys
+import zlib
 from pathlib import Path
+
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 ANIMA_KOHYA_ATTN_MAP = {
     "self_attn_q_proj": "attn1.to_q",
@@ -268,6 +272,68 @@ def _analyze_diffusers(keys):
     print("\n  No conversion needed.")
 
 
+def is_png(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read(8) == PNG_SIGNATURE
+    except OSError:
+        return False
+
+
+def read_png_text(path):
+    chunks = []
+    with open(path, "rb") as f:
+        if f.read(8) != PNG_SIGNATURE:
+            raise ValueError("Not a PNG file.")
+        while True:
+            head = f.read(8)
+            if len(head) < 8:
+                break
+            length, ctype = struct.unpack(">I4s", head)
+            data = f.read(length)
+            f.read(4)  # CRC, unchecked.
+            ctype = ctype.decode("latin-1")
+            if ctype == "IEND":
+                break
+            if ctype == "tEXt":
+                key, _, val = data.partition(b"\x00")
+                chunks.append((key.decode("latin-1"), val.decode("latin-1")))
+            elif ctype == "zTXt":
+                key, _, rest = data.partition(b"\x00")
+                try:
+                    val = zlib.decompress(rest[1:]).decode("latin-1")
+                except zlib.error:
+                    val = "<undecodable zTXt>"
+                chunks.append((key.decode("latin-1"), val))
+            elif ctype == "iTXt":
+                key, _, rest = data.partition(b"\x00")
+                compressed = rest[:1] == b"\x01"
+                rest = rest[2:]
+                _lang, _, rest = rest.partition(b"\x00")
+                _tkey, _, text = rest.partition(b"\x00")
+                if compressed:
+                    try:
+                        text = zlib.decompress(text)
+                    except zlib.error:
+                        text = b"<undecodable iTXt>"
+                chunks.append((key.decode("latin-1"), text.decode("utf-8", "replace")))
+    return chunks
+
+
+def print_png_metadata(path, chunks):
+    print(f"File: {path}")
+    print(f"  On disk:        {human_size(path.stat().st_size)}")
+    print(f"  Text chunks:    {len(chunks)}")
+    if not chunks:
+        print("\n  (No text metadata found.)")
+        return
+    print("\n== PNG metadata ==")
+    for key, value in chunks:
+        if len(value) > 5000:
+            value = value[:5000] + "... [truncated]"
+        print(f"  {key}: {value}")
+
+
 def main(argv):
     if len(argv) != 2 or argv[1] in ("-h", "--help"):
         print(__doc__)
@@ -277,6 +343,15 @@ def main(argv):
     if not path.is_file():
         print(f"Error: not a file: {path}.", file=sys.stderr)
         return 2
+
+    if is_png(path):
+        try:
+            chunks = read_png_text(path)
+        except (OSError, ValueError) as e:
+            print(f"Error reading {path}: {e}.", file=sys.stderr)
+            return 1
+        print_png_metadata(path, chunks)
+        return 0
 
     try:
         header = read_safetensors_header(path)
