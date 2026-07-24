@@ -153,6 +153,7 @@ ANIMA_DEFAULT_SIZE = 512
 
 ANIMA_SAMPLERS = ("Euler", "Euler Ancestral", "UniPC")
 ANIMA_DEFAULT_SAMPLER = "Euler"
+ANIMA_DEFAULT_SHIFT = 3.0
 
 # XXX: Real value here?
 ANIMA_TOKEN_LIMIT = 512
@@ -180,20 +181,24 @@ ANIMA_LATENT_RGB_FACTORS = [
 ANIMA_LATENT_RGB_BIAS = [-0.1835, -0.0868, -0.3360]
 
 
-def build_anima_scheduler(sampler, base_scheduler):
+def build_anima_scheduler(sampler, base_scheduler, shift=None):
     config = dict(base_scheduler.config)
+
+    if shift is None:
+        shift = config.get("shift", 1.0)
+    try:
+        shift = float(shift)
+    except (TypeError, ValueError):
+        shift = 1.0
+    if shift <= 0.0:
+        shift = 1.0
 
     if sampler == "Euler Ancestral":
         return FlowMatchEulerDiscreteScheduler.from_config(
-            config, stochastic_sampling=True
+            config, shift=shift, stochastic_sampling=True
         )
 
     if sampler == "UniPC":
-        shift = config.get("shift", 1.0)
-        try:
-            shift = float(shift)
-        except (TypeError, ValueError):
-            shift = 1.0
         return UniPCMultistepScheduler(
             num_train_timesteps=int(config.get("num_train_timesteps", 1000)),
             solver_order=2,
@@ -202,7 +207,7 @@ def build_anima_scheduler(sampler, base_scheduler):
             flow_shift=shift,
         )
 
-    return FlowMatchEulerDiscreteScheduler.from_config(config)
+    return FlowMatchEulerDiscreteScheduler.from_config(config, shift=shift)
 
 
 _gui_instance = None
@@ -710,6 +715,26 @@ class AnimusGUI(Gtk.Window):
         sampler_box.pack_start(self.sampler_combo, False, False, 0)
         controls_box.pack_start(sampler_box, False, False, 0)
 
+        shift_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        shift_label = Gtk.Label(label="Shift:")
+        shift_label.set_size_request(100, -1)
+        shift_label.set_xalign(0)
+        shift_box.pack_start(shift_label, False, False, 0)
+
+        self.shift_spin = Gtk.SpinButton()
+        shift_adj = Gtk.Adjustment(
+            value=ANIMA_DEFAULT_SHIFT,
+            lower=0.10,
+            upper=12.0,
+            step_increment=0.05,
+            page_increment=0.5,
+        )
+        self.shift_spin.set_adjustment(shift_adj)
+        self.shift_spin.set_digits(2)
+        self.shift_spin.set_size_request(100, -1)
+        shift_box.pack_start(self.shift_spin, False, False, 0)
+        controls_box.pack_start(shift_box, False, False, 0)
+
         preview_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
         preview_label = Gtk.Label(label="Live preview:")
         preview_label.set_size_request(100, -1)
@@ -949,6 +974,8 @@ class AnimusGUI(Gtk.Window):
                     self.guidance_spin.set_value(settings["guidance"])
                 if settings.get("sampler") in ANIMA_SAMPLERS:
                     self.sampler_combo.set_active_id(settings["sampler"])
+                if "shift" in settings:
+                    self.shift_spin.set_value(settings["shift"])
                 if "width" in settings:
                     self.width_spin.set_value(settings["width"])
                 if "height" in settings:
@@ -1007,6 +1034,7 @@ class AnimusGUI(Gtk.Window):
                 "steps": int(self.steps_spin.get_value()),
                 "guidance": float(self.guidance_spin.get_value()),
                 "sampler": self.sampler_combo.get_active_id() or ANIMA_DEFAULT_SAMPLER,
+                "shift": float(self.shift_spin.get_value()),
                 "width": int(self.width_spin.get_value()),
                 "height": int(self.height_spin.get_value()),
                 "preview": self.preview_check.get_active(),
@@ -1788,12 +1816,12 @@ class AnimusGUI(Gtk.Window):
                 print(f"  -> Sending SIGINT to process (PID {os.getpid()}).")
                 os.kill(os.getpid(), signal.SIGINT)
 
-    def _apply_sampler(self, sampler):
+    def _apply_sampler(self, sampler, shift=None):
         base = self._base_scheduler or getattr(self.pipe, "scheduler", None)
         if base is None or self.pipe is None:
             return
         try:
-            scheduler = build_anima_scheduler(sampler, base)
+            scheduler = build_anima_scheduler(sampler, base, shift)
             self.pipe.update_components(scheduler=scheduler)
         except Exception as e:
             print(
@@ -1858,13 +1886,14 @@ class AnimusGUI(Gtk.Window):
             width = int(self.width_spin.get_value())
             height = int(self.height_spin.get_value())
             sampler = self.sampler_combo.get_active_id() or ANIMA_DEFAULT_SAMPLER
+            shift = float(self.shift_spin.get_value())
 
-            self._apply_sampler(sampler)
+            self._apply_sampler(sampler, shift)
             self._apply_guidance(guidance)
 
             self.update_status(
-                f"Generating with Anima ({sampler}) at {width}x{height} with "
-                f"{steps} steps and guidance {guidance}..."
+                f"Generating with Anima ({sampler}, shift {shift:g}) at "
+                f"{width}x{height} with {steps} steps and guidance {guidance}..."
             )
 
             self.preview_shown = False
@@ -2035,6 +2064,7 @@ class AnimusGUI(Gtk.Window):
         self.steps_spin.set_value(ANIMA_DEFAULT_STEPS)
         self.guidance_spin.set_value(ANIMA_DEFAULT_GUIDANCE)
         self.sampler_combo.set_active_id(ANIMA_DEFAULT_SAMPLER)
+        self.shift_spin.set_value(ANIMA_DEFAULT_SHIFT)
 
         self.trigger_text.get_buffer().set_text("")
         self.prompt_text.get_buffer().set_text("")
