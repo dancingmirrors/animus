@@ -26,6 +26,7 @@ from datetime import datetime
 import threading
 import ctypes
 import re
+import random
 
 
 def _init_fontconfig():
@@ -87,6 +88,7 @@ except Exception:
         ClassifierFreeGuidance = None
 
 from PIL import Image as _PILImage
+from PIL.PngImagePlugin import PngInfo
 
 _PILImage.preinit()
 
@@ -154,6 +156,8 @@ ANIMA_DEFAULT_SIZE = 512
 ANIMA_SAMPLERS = ("Euler", "Euler Ancestral", "UniPC")
 ANIMA_DEFAULT_SAMPLER = "Euler"
 ANIMA_DEFAULT_SHIFT = 3.0
+ANIMA_DEFAULT_SEED = -1
+ANIMA_SEED_MAX = 2**32 - 1
 
 # XXX: Real value here?
 ANIMA_TOKEN_LIMIT = 512
@@ -735,6 +739,31 @@ class AnimusGUI(Gtk.Window):
         shift_box.pack_start(self.shift_spin, False, False, 0)
         controls_box.pack_start(shift_box, False, False, 0)
 
+        seed_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        seed_label = Gtk.Label(label="Seed:")
+        seed_label.set_size_request(100, -1)
+        seed_label.set_xalign(0)
+        seed_box.pack_start(seed_label, False, False, 0)
+
+        self.seed_spin = Gtk.SpinButton()
+        seed_adj = Gtk.Adjustment(
+            value=ANIMA_DEFAULT_SEED,
+            lower=-1,
+            upper=ANIMA_SEED_MAX,
+            step_increment=1,
+            page_increment=1000,
+        )
+        self.seed_spin.set_adjustment(seed_adj)
+        self.seed_spin.set_size_request(150, -1)
+        seed_box.pack_start(self.seed_spin, False, False, 0)
+
+        seed_random_btn = Gtk.Button(label="Random")
+        seed_random_btn.connect(
+            "clicked", lambda _btn: self.seed_spin.set_value(ANIMA_DEFAULT_SEED)
+        )
+        seed_box.pack_start(seed_random_btn, False, False, 0)
+        controls_box.pack_start(seed_box, False, False, 0)
+
         preview_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
         preview_label = Gtk.Label(label="Live preview:")
         preview_label.set_size_request(100, -1)
@@ -976,6 +1005,8 @@ class AnimusGUI(Gtk.Window):
                     self.sampler_combo.set_active_id(settings["sampler"])
                 if "shift" in settings:
                     self.shift_spin.set_value(settings["shift"])
+                if "seed" in settings:
+                    self.seed_spin.set_value(settings["seed"])
                 if "width" in settings:
                     self.width_spin.set_value(settings["width"])
                 if "height" in settings:
@@ -1035,6 +1066,7 @@ class AnimusGUI(Gtk.Window):
                 "guidance": float(self.guidance_spin.get_value()),
                 "sampler": self.sampler_combo.get_active_id() or ANIMA_DEFAULT_SAMPLER,
                 "shift": float(self.shift_spin.get_value()),
+                "seed": int(self.seed_spin.get_value()),
                 "width": int(self.width_spin.get_value()),
                 "height": int(self.height_spin.get_value()),
                 "preview": self.preview_check.get_active(),
@@ -1853,6 +1885,24 @@ class AnimusGUI(Gtk.Window):
                 f"component: {e}. The pipeline's default CFG will be used."
             )
 
+    def _png_metadata(self, **params):
+        info = PngInfo()
+        info.add_text("software", "Animus")
+        info.add_text("model", self.model_entry.get_text())
+        loras = []
+        for lora_entry, (weight_name_entry, weight_spin) in zip(
+            self.lora_entries, self.lora_weight_entries
+        ):
+            path = lora_entry.get_text().strip()
+            if path:
+                name = weight_name_entry.get_text().strip()
+                loras.append(f"{path}/{name}@{weight_spin.get_value():g}")
+        if loras:
+            info.add_text("loras", ", ".join(loras))
+        for key, value in params.items():
+            info.add_text(key, str(value))
+        return info
+
     def generate_image_thread(self):
         try:
             prompt_buffer = self.prompt_text.get_buffer()
@@ -1887,13 +1937,18 @@ class AnimusGUI(Gtk.Window):
             height = int(self.height_spin.get_value())
             sampler = self.sampler_combo.get_active_id() or ANIMA_DEFAULT_SAMPLER
             shift = float(self.shift_spin.get_value())
+            seed = int(self.seed_spin.get_value())
+            if seed < 0:
+                seed = random.randint(0, ANIMA_SEED_MAX)
+            generator = torch.Generator(device="cpu").manual_seed(seed)
 
             self._apply_sampler(sampler, shift)
             self._apply_guidance(guidance)
 
             self.update_status(
                 f"Generating with Anima ({sampler}, shift {shift:g}) at "
-                f"{width}x{height} with {steps} steps and guidance {guidance}..."
+                f"{width}x{height} with {steps} steps, guidance {guidance}, "
+                f"and seed {seed}..."
             )
 
             self.preview_shown = False
@@ -1909,6 +1964,7 @@ class AnimusGUI(Gtk.Window):
                     num_inference_steps=steps,
                     width=width,
                     height=height,
+                    generator=generator,
                 )
 
                 image = getattr(result, "images", [None])[0] if result else None
@@ -1922,10 +1978,20 @@ class AnimusGUI(Gtk.Window):
             elif image is not None:
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 output_path = OUTPUT_DIR / f"animus_{timestamp}.png"
-                image.save(str(output_path), format="PNG")
+                info = self._png_metadata(
+                    prompt=full_prompt,
+                    negative_prompt=negative_prompt,
+                    steps=steps,
+                    guidance=guidance,
+                    sampler=sampler,
+                    shift=shift,
+                    seed=seed,
+                    size=f"{width}x{height}",
+                )
+                image.save(str(output_path), format="PNG", pnginfo=info)
 
                 GLib.idle_add(self._display_image, str(output_path))
-                self.update_status(f"Done! Image saved to {output_path}.")
+                self.update_status(f"Done! Image saved to {output_path} (seed {seed}).")
             else:
                 self.update_status("No image produced.")
 
@@ -2065,6 +2131,7 @@ class AnimusGUI(Gtk.Window):
         self.guidance_spin.set_value(ANIMA_DEFAULT_GUIDANCE)
         self.sampler_combo.set_active_id(ANIMA_DEFAULT_SAMPLER)
         self.shift_spin.set_value(ANIMA_DEFAULT_SHIFT)
+        self.seed_spin.set_value(ANIMA_DEFAULT_SEED)
 
         self.trigger_text.get_buffer().set_text("")
         self.prompt_text.get_buffer().set_text("")
