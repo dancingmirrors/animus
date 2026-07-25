@@ -50,6 +50,38 @@ else
     exit 1
 fi
 
+ensure_include() {
+    file="$1"
+    header="$2"
+    anchor="$3"
+    line="#include <$header>"
+
+    if [ ! -f "$file" ]; then
+        echo "ERROR: $file not found. Check $TORCH_VERSION." >&2
+        exit 1
+    fi
+    if grep -qxF "$line" "$file"; then
+        echo "==> $file already includes <$header>."
+        return 0
+    fi
+    if ! grep -qxF "$anchor" "$file"; then
+        echo "ERROR: anchor '$anchor' not found in $file." >&2
+        echo "       Update the patch in $0." >&2
+        exit 1
+    fi
+    awk -v line="$line" -v anchor="$anchor" '
+        $0 == anchor && !inserted { print line; inserted = 1 }
+        { print }
+    ' "$file" > "$file.tmp" && mv "$file.tmp" "$file"
+    grep -qxF "$line" "$file" || {
+        echo "ERROR: our patch failed to apply to $file." >&2
+        exit 1
+    }
+    echo "==> Patched $file with <$header> successfully."
+}
+
+ensure_include caffe2/utils/string_utils.h cstdint '#include <memory>'
+
 BUILD_VENV="${BUILD_VENV:-$SRC_DIR/.buildvenv}"
 if [ -x "$BUILD_VENV/bin/python" ] && [ -f "$BUILD_VENV/bin/pip" ]; then
     interp=$(sed -n '1s/^#!\([^ ]*\).*/\1/p' "$BUILD_VENV/bin/pip")
