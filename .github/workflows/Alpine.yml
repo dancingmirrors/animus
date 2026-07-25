@@ -1,0 +1,102 @@
+name: Alpine (musl, source build)
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  Alpine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    permissions:
+      contents: read
+
+    env:
+      TORCH_VERSION: v2.9.1
+      MARCH: x86-64-v2
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 2G
+
+    steps:
+    - name: actions/checkout@v7
+      uses: actions/checkout@v7
+
+    - name: Free up disk space
+      run: |
+        sudo rm -fr /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+                    /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+        df -h /
+
+    - name: jirutka/setup-alpine@v1
+      uses: jirutka/setup-alpine@v1
+      with:
+        branch: latest-stable
+        packages: >
+          bash
+          build-base
+          cairo-dev
+          ccache
+          clang
+          cmake
+          git
+          glib-dev
+          gobject-introspection-dev
+          gtk+3.0
+          gtk+3.0-dev
+          linux-headers
+          ninja-is-really-ninja
+          openblas-dev
+          pkgconf
+          py3-pip
+          py3-virtualenv
+          python3-dev
+
+    - name: Confirm it's musl
+      shell: alpine.sh --root {0}
+      run: |
+        ldd /usr/bin/python3
+        ldd /usr/bin/python3 | grep musl
+
+    - name: Restore ccache
+      uses: actions/cache@v5
+      with:
+        path: .ccache
+        key: ccache-musl-${{ env.TORCH_VERSION }}-${{ hashFiles('build-torch.sh') }}-${{ github.run_id }}
+        restore-keys: |
+          ccache-musl-${{ env.TORCH_VERSION }}-${{ hashFiles('build-torch.sh') }}-
+          ccache-musl-${{ env.TORCH_VERSION }}-
+          ccache-musl-
+
+    - name: make install (source build)
+      shell: alpine.sh --root {0}
+      run: |
+        set -e
+        export HOME=/root
+        export TORCH_VERSION='${{ env.TORCH_VERSION }}'
+        export MARCH='${{ env.MARCH }}'
+        export CCACHE_DIR='${{ github.workspace }}/.ccache'
+        export CCACHE_MAXSIZE='${{ env.CCACHE_MAXSIZE }}'
+        make install
+
+    - name: Verify important imports
+      shell: alpine.sh --root {0}
+      run: |
+        set -e
+        export HOME=/root
+        . "$HOME/.local/lib/animus/venv/bin/activate"
+        python3 -c "import gi; gi.require_version('Gtk', '3.0'); from gi.repository import Gtk, GdkPixbuf, GLib; print('The relevant GTK imports were successful.')"
+        python3 -c "from transformers import CLIPTokenizer; print('The CLIPTokenizer import was successful.')"
+        python3 -c "from diffusers import ModularPipeline, CosmosTransformer3DModel, GGUFQuantizationConfig; print('The relevant diffusers imports were successful.')"
+        python3 -c "import torch; print(f'The torch import was successful at version {torch.__version__}.')"
+
+    - name: ccache stats
+      if: always()
+      shell: alpine.sh --root {0}
+      run: ccache -s || true
