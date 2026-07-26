@@ -106,6 +106,34 @@ ensure_include() {
 
 ensure_include caffe2/utils/string_utils.h cstdint '#include <memory>'
 
+evf="cmake/EnvVarForwarding.cmake"
+evf_marker="# Animus: re-read our build options straight from the environment."
+if [ ! -f "$evf" ]; then
+    echo "==> No $evf. This PyTorch forwards the environment from setup.py."
+elif grep -qxF "$evf_marker" "$evf"; then
+    echo "==> $evf already patched."
+else
+    cat >> "$evf" <<'PATCH'
+
+# Animus: re-read our build options straight from the environment.
+foreach(_animus_var
+    BUILD_TEST
+    CMAKE_C_FLAGS CMAKE_CXX_FLAGS
+    USE_CUDA USE_DISTRIBUTED USE_FBGEMM USE_KINETO USE_MKLDNN
+    USE_NNPACK USE_QNNPACK USE_ROCM USE_XNNPACK)
+  if(DEFINED ENV{${_animus_var}} AND NOT DEFINED ${_animus_var})
+    set(${_animus_var} "$ENV{${_animus_var}}"
+        CACHE STRING "From env ${_animus_var}" FORCE)
+  endif()
+endforeach()
+PATCH
+    grep -qxF "$evf_marker" "$evf" || {
+        echo "ERROR: our patch failed to apply to $evf." >&2
+        exit 1
+    }
+    echo "==> Patched $evf successfully."
+fi
+
 if [ -x "$BUILD_VENV/bin/python" ] && [ -f "$BUILD_VENV/bin/pip" ]; then
     interp=$(sed -n '1s/^#!\([^ ]*\).*/\1/p' "$BUILD_VENV/bin/pip")
     if [ -n "$interp" ] && [ ! -x "$interp" ]; then
