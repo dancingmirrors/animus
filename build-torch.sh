@@ -8,16 +8,25 @@ MAX_JOBS="${MAX_JOBS:-$(nproc 2>/dev/null || echo 2)}"
 MARCH="${MARCH:-native}"
 SRC_DIR="${SRC_DIR:-$(pwd)/.torch-src}"
 OUT_DIR="$(pwd)/wheels"
+BUILD_VENV="${BUILD_VENV:-$SRC_DIR/.buildvenv}"
+STAMP="$SRC_DIR/.animus-built-version"
 
 echo "==> torch $TORCH_VERSION | python=$PYTHON | jobs=$MAX_JOBS | march=$MARCH"
 
 mkdir -p "$OUT_DIR"
 
+fresh_clone=0
 if [ ! -d "$SRC_DIR/.git" ]; then
     git clone --depth 1 --branch "$TORCH_VERSION" --recursive \
         https://github.com/pytorch/pytorch "$SRC_DIR"
+    fresh_clone=1
 fi
 cd "$SRC_DIR"
+
+built=""
+if [ -f "$STAMP" ]; then
+    built="$(cat "$STAMP")"
+fi
 
 current="$(git describe --tags --exact-match 2>/dev/null || echo '')"
 if [ "$current" = "$TORCH_VERSION" ]; then
@@ -28,6 +37,21 @@ else
     git submodule sync --recursive
     git submodule update --init --recursive --depth 1
 fi
+
+if [ "$fresh_clone" = 0 ] && [ "$built" != "$TORCH_VERSION" ]; then
+    echo "==> Discarding build artifacts from ${built:-an unknown version}."
+    case "$BUILD_VENV" in
+        "$SRC_DIR"/*)
+            git clean -xfdq -e "${BUILD_VENV#"$SRC_DIR"/}"
+            ;;
+        *)
+            git clean -xfdq
+            ;;
+    esac
+    git submodule foreach --quiet --recursive 'git clean -xfdq'
+fi
+
+printf '%s\n' "$TORCH_VERSION" > "$STAMP"
 
 mh="torch/headeronly/macros/Macros.h"
 if [ ! -f "$mh" ]; then
@@ -82,7 +106,6 @@ ensure_include() {
 
 ensure_include caffe2/utils/string_utils.h cstdint '#include <memory>'
 
-BUILD_VENV="${BUILD_VENV:-$SRC_DIR/.buildvenv}"
 if [ -x "$BUILD_VENV/bin/python" ] && [ -f "$BUILD_VENV/bin/pip" ]; then
     interp=$(sed -n '1s/^#!\([^ ]*\).*/\1/p' "$BUILD_VENV/bin/pip")
     if [ -n "$interp" ] && [ ! -x "$interp" ]; then
@@ -123,6 +146,8 @@ fi
 
 "$VPY" setup.py bdist_wheel
 
-cp dist/torch-*.whl "$OUT_DIR"/
+wheel="$(ls -t dist/torch-*.whl | head -n 1)"
+rm -f "$OUT_DIR"/torch-*.whl
+cp "$wheel" "$OUT_DIR"/
 echo
-echo "==> Built $(ls "$OUT_DIR"/torch-*.whl)."
+echo "==> Built $OUT_DIR/$(basename "$wheel")."
