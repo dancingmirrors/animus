@@ -2,7 +2,7 @@
 
 set -eu
 
-TORCH_VERSION="${TORCH_VERSION:-v2.9.1}"
+TORCH_VERSION="${TORCH_VERSION:-v2.12.1}"
 PYTHON="${PYTHON:-python3}"
 MAX_JOBS="${MAX_JOBS:-$(nproc 2>/dev/null || echo 2)}"
 MARCH="${MARCH:-native}"
