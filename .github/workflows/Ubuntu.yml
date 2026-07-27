@@ -33,12 +33,6 @@ jobs:
       with:
         python-version: '3.14'
 
-    - name: Free up disk space
-      run: |
-        sudo rm -fr /usr/share/dotnet /opt/ghc /usr/local/lib/android \
-                    /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
-        df -h /
-
     - name: apt-get
       run: |
         sudo apt-get update

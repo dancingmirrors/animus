@@ -28,12 +28,6 @@ jobs:
     - name: actions/checkout@v7
       uses: actions/checkout@v7
 
-    - name: Free up disk space
-      run: |
-        sudo rm -fr /usr/share/dotnet /opt/ghc /usr/local/lib/android \
-                    /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
-        df -h /
-
     - name: jirutka/setup-alpine@v1
       uses: jirutka/setup-alpine@v1
       with:
