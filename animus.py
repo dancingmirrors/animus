@@ -171,18 +171,28 @@ CONFIG_FILE = _relocate("settings.json", CONFIG_DIR)
 OUTPUT_DIR = _relocate("outputs", DATA_DIR)
 LORA_DIR = _relocate("loras", DATA_DIR)
 MODEL_DIR = _relocate("models", DATA_DIR)
-EMBEDDING_DIR = _relocate("embeddings", DATA_DIR)
+
+
+def _prune_embedding_dir():
+    for stale in (DATA_DIR / "embeddings", LEGACY_DIR / "embeddings"):
+        try:
+            stale.rmdir()
+        except OSError:
+            continue
+        print(f"Removed the unused {stale}.")
+
+
+_prune_embedding_dir()
 
 
 def _repoint_settings_paths():
     moves = [
         (LEGACY_DIR / "models", MODEL_DIR),
         (LEGACY_DIR / "loras", LORA_DIR),
-        (LEGACY_DIR / "embeddings", EMBEDDING_DIR),
     ]
     moves = [(old, new) for old, new in moves if old != new]
 
-    if not moves or not CONFIG_FILE.exists():
+    if not CONFIG_FILE.exists():
         return
 
     def repoint(value):
@@ -212,17 +222,21 @@ def _repoint_settings_paths():
             settings["model"] = moved
             changed = True
 
-    for key in ("loras", "embeddings"):
-        for entry in settings.get(key) or []:
-            if not isinstance(entry, dict):
-                continue
-            path = entry.get("path")
-            if not isinstance(path, str):
-                continue
-            moved = repoint(path)
-            if moved != path:
-                entry["path"] = moved
-                changed = True
+    for entry in settings.get("loras") or []:
+        if not isinstance(entry, dict):
+            continue
+        path = entry.get("path")
+        if not isinstance(path, str):
+            continue
+        moved = repoint(path)
+        if moved != path:
+            entry["path"] = moved
+            changed = True
+
+    for key in ("embeddings", "embedding"):
+        if key in settings:
+            del settings[key]
+            changed = True
 
     if not changed:
         return
@@ -269,7 +283,6 @@ GENERATION_THREAD_TIMEOUT = 5.0
 LOAD_THREAD_TIMEOUT = 3.0
 
 NUM_LORA_SLOTS = 4
-NUM_EMBEDDING_SLOTS = 2
 
 ANIMA_COMPONENTS_REPO = "circlestone-labs/Anima-Base-v1.0-Diffusers"
 ANIMA_DEFAULT_DIT = (
@@ -637,7 +650,6 @@ class AnimusGUI(Gtk.Window):
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         LORA_DIR.mkdir(parents=True, exist_ok=True)
         MODEL_DIR.mkdir(parents=True, exist_ok=True)
-        EMBEDDING_DIR.mkdir(parents=True, exist_ok=True)
 
         main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         self.add(main_box)
@@ -727,55 +739,6 @@ class AnimusGUI(Gtk.Window):
             lora_frame_box.pack_start(lora_weight_box, False, False, 0)
 
             controls_box.pack_start(lora_frame, False, False, 0)
-
-        self.embedding_entries = []
-        self.embedding_token_entries = []
-
-        for i in range(NUM_EMBEDDING_SLOTS):
-            embedding_frame = Gtk.Frame(label=f"Negative Embedding {i + 1}")
-            embedding_frame_box = Gtk.Box(
-                orientation=Gtk.Orientation.VERTICAL, spacing=5
-            )
-            embedding_frame_box.set_border_width(5)
-            embedding_frame.add(embedding_frame_box)
-
-            embedding_path_box = Gtk.Box(
-                orientation=Gtk.Orientation.HORIZONTAL, spacing=5
-            )
-            embedding_path_label = Gtk.Label(label="File:")
-            embedding_path_label.set_size_request(80, -1)
-            embedding_path_label.set_xalign(0)
-            embedding_path_box.pack_start(embedding_path_label, False, False, 0)
-
-            embedding_entry = Gtk.Entry()
-            embedding_path_box.pack_start(embedding_entry, True, True, 0)
-            self.embedding_entries.append(embedding_entry)
-
-            embedding_browse_btn = Gtk.Button(label="Browse...")
-            embedding_browse_btn.connect("clicked", self.on_browse_embedding, i)
-            embedding_path_box.pack_start(embedding_browse_btn, False, False, 0)
-
-            embedding_clear_btn = Gtk.Button(label="Clear")
-            embedding_clear_btn.connect("clicked", self.on_clear_embedding, i)
-            embedding_path_box.pack_start(embedding_clear_btn, False, False, 0)
-
-            embedding_frame_box.pack_start(embedding_path_box, False, False, 0)
-
-            embedding_token_box = Gtk.Box(
-                orientation=Gtk.Orientation.HORIZONTAL, spacing=5
-            )
-            embedding_token_label = Gtk.Label(label="Token:")
-            embedding_token_label.set_size_request(80, -1)
-            embedding_token_label.set_xalign(0)
-            embedding_token_box.pack_start(embedding_token_label, False, False, 0)
-
-            embedding_token_entry = Gtk.Entry()
-            embedding_token_box.pack_start(embedding_token_entry, True, True, 0)
-            self.embedding_token_entries.append(embedding_token_entry)
-
-            embedding_frame_box.pack_start(embedding_token_box, False, False, 0)
-
-            controls_box.pack_start(embedding_frame, False, False, 0)
 
         resolution_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
         resolution_label = Gtk.Label(label="Size (W x H):")
@@ -1163,20 +1126,6 @@ class AnimusGUI(Gtk.Window):
                     self.neg_prompt_text.get_buffer().set_text(
                         settings["negative_prompt"]
                     )
-
-                embeddings = settings.get("embeddings")
-                if embeddings is None and "embedding" in settings:
-                    embeddings = [settings["embedding"]]
-                if embeddings:
-                    for i, embedding_data in enumerate(
-                        embeddings[:NUM_EMBEDDING_SLOTS]
-                    ):
-                        self.embedding_entries[i].set_text(
-                            embedding_data.get("path", "")
-                        )
-                        self.embedding_token_entries[i].set_text(
-                            embedding_data.get("token", "")
-                        )
         except Exception as e:
             print(f"Error loading settings: {e}.")
         finally:
@@ -1215,15 +1164,6 @@ class AnimusGUI(Gtk.Window):
                 "trigger": trigger,
                 "prompt": prompt,
                 "negative_prompt": negative_prompt,
-                "embeddings": [
-                    {
-                        "path": embedding_entry.get_text(),
-                        "token": embedding_token_entry.get_text(),
-                    }
-                    for embedding_entry, embedding_token_entry in zip(
-                        self.embedding_entries, self.embedding_token_entries
-                    )
-                ],
             }
 
             for lora_entry, (weight_name_entry, weight_spin) in zip(
@@ -1414,57 +1354,6 @@ class AnimusGUI(Gtk.Window):
         weight_name_entry.set_text("")
         weight_spin.set_value(0.5)
 
-    def on_browse_embedding(self, button, embedding_index):
-        dialog = Gtk.FileChooserDialog(
-            title="Select Negative Embedding File",
-            parent=self,
-            action=Gtk.FileChooserAction.OPEN,
-        )
-        dialog.add_buttons(
-            Gtk.STOCK_CANCEL,
-            Gtk.ResponseType.CANCEL,
-            Gtk.STOCK_OPEN,
-            Gtk.ResponseType.OK,
-        )
-
-        filter_embedding = Gtk.FileFilter()
-        filter_embedding.set_name("Embedding files")
-        for pattern in ("*.safetensors", "*.pt", "*.bin"):
-            filter_embedding.add_pattern(pattern)
-        dialog.add_filter(filter_embedding)
-
-        filter_all = Gtk.FileFilter()
-        filter_all.set_name("All files")
-        filter_all.add_pattern("*")
-        dialog.add_filter(filter_all)
-
-        response = dialog.run()
-        if response == Gtk.ResponseType.OK:
-            selected_path = dialog.get_filename()
-            if not selected_path:
-                dialog.destroy()
-                return
-
-            path_obj = Path(selected_path)
-
-            if path_obj.is_file():
-                dest_file = EMBEDDING_DIR / path_obj.stem / path_obj.name
-
-                if self._copy_to_library(path_obj, dest_file, "embedding file"):
-                    self.embedding_entries[embedding_index].set_text(str(dest_file))
-                else:
-                    self.embedding_entries[embedding_index].set_text(str(path_obj))
-
-                self.embedding_token_entries[embedding_index].set_text(path_obj.stem)
-            else:
-                print(f"Warning: selected path is not a file: {selected_path}.")
-
-        dialog.destroy()
-
-    def on_clear_embedding(self, button, embedding_index):
-        self.embedding_entries[embedding_index].set_text("")
-        self.embedding_token_entries[embedding_index].set_text("")
-
     def on_load_clicked(self, button):
         if self.generating or self.loading_model:
             return
@@ -1522,11 +1411,6 @@ class AnimusGUI(Gtk.Window):
                 return
 
             self._load_loras()
-
-            if self._check_stop_loading(cleanup_pipe=True):
-                return
-
-            self._load_textual_inversions()
 
             if self._check_stop_loading(cleanup_pipe=True):
                 return
@@ -1793,137 +1677,6 @@ class AnimusGUI(Gtk.Window):
         except Exception as e:
             traceback.print_exc()
             self.update_status(f"Warning: could not activate LoRA adapters: {str(e)}.")
-
-    def _extract_embedding_tensor(self, obj):
-        if isinstance(obj, torch.Tensor):
-            return obj
-        if isinstance(obj, dict):
-            s2p = obj.get("string_to_param")
-            if isinstance(s2p, dict):
-                for val in s2p.values():
-                    if isinstance(val, torch.Tensor):
-                        return val
-            for key in ("emb_params", "embedding", "clip_l", "weight", "*"):
-                val = obj.get(key)
-                if isinstance(val, torch.Tensor):
-                    return val
-            tensors = [v for v in obj.values() if isinstance(v, torch.Tensor)]
-            two_d = [t for t in tensors if t.dim() == 2]
-            if len(two_d) == 1:
-                return two_d[0]
-            if len(tensors) == 1:
-                return tensors[0]
-        return None
-
-    def _load_embedding_file(self, path):
-        p = Path(path)
-        if not p.is_file():
-            raise FileNotFoundError(f"Error: file not found: {path}.")
-
-        if p.suffix.lower() == ".safetensors":
-            from safetensors.torch import load_file
-
-            raw = load_file(str(p))
-        else:
-            raw = torch.load(str(p), map_location="cpu", weights_only=True)
-
-        emb = self._extract_embedding_tensor(raw)
-        if emb is None:
-            raise ValueError("no embedding tensor found in the file")
-
-        emb = emb.detach().to(dtype=torch.float32)
-        if emb.dim() == 1:
-            emb = emb.unsqueeze(0)
-        if emb.dim() != 2:
-            raise ValueError(f"unexpected embedding shape {tuple(emb.shape)}")
-        return emb
-
-    def _load_textual_inversions(self):
-        embeddings_to_load = []
-        for embedding_entry, embedding_token_entry in zip(
-            self.embedding_entries, self.embedding_token_entries
-        ):
-            path = embedding_entry.get_text().strip()
-            token = embedding_token_entry.get_text().strip()
-            if path and token:
-                embeddings_to_load.append((path, token))
-
-        if not embeddings_to_load:
-            return
-
-        tokenizer = getattr(self.pipe, "tokenizer", None)
-        text_encoder = getattr(self.pipe, "text_encoder", None)
-        if tokenizer is None or text_encoder is None:
-            self.update_status(
-                "Warning: this pipeline exposes no tokenizer or text_encoder. "
-                "Skipping."
-            )
-            return
-
-        try:
-            encoder_dim = text_encoder.get_input_embeddings().weight.shape[1]
-        except Exception as e:
-            self.update_status(
-                f"Warning: could not inspect the text encoder embeddings: {e}. "
-                "Skipping."
-            )
-            return
-
-        for path, token in embeddings_to_load:
-            if self._check_stop_loading(cleanup_pipe=True):
-                return
-
-            self.update_status(f"Loading negative embedding '{token}'...")
-            try:
-                emb = self._load_embedding_file(path)
-            except Exception as e:
-                self.update_status(
-                    f"Warning: could not read embedding '{token}' ({path}): "
-                    f"{e}. Skipping."
-                )
-                continue
-
-            num_vectors, dim = emb.shape[0], emb.shape[1]
-            if dim != encoder_dim:
-                self.update_status(
-                    f"Warning: embedding '{token}' has dimension {dim} but the "
-                    f"Anima text encoder expects {encoder_dim}. It was likely "
-                    "trained for a different model. Skipping."
-                )
-                continue
-
-            tokens = [token] + [f"{token}_{i}" for i in range(1, num_vectors)]
-            num_added = tokenizer.add_tokens(tokens)
-            if num_added != len(tokens):
-                self.update_status(
-                    f"Warning: '{token}' already exists in the " "tokenizer. Skipping."
-                )
-                continue
-
-            try:
-                text_encoder.resize_token_embeddings(len(tokenizer))
-                input_embeddings = text_encoder.get_input_embeddings()
-                token_ids = tokenizer.convert_tokens_to_ids(tokens)
-                with torch.no_grad():
-                    for i, token_id in enumerate(token_ids):
-                        input_embeddings.weight[token_id] = emb[i].to(
-                            dtype=input_embeddings.weight.dtype,
-                            device=input_embeddings.weight.device,
-                        )
-            except Exception as e:
-                traceback.print_exc()
-                self.update_status(
-                    f"Warning: could not inject embedding '{token}': {e}. Skipping."
-                )
-                continue
-
-            if num_vectors == 1:
-                self.update_status(f"Loaded negative embedding '{token}' (dim {dim}).")
-            else:
-                self.update_status(
-                    f"Loaded negative embedding '{token}' as {num_vectors} "
-                    f"tokens {tokens} (dim {dim})."
-                )
 
     def _enable_generate_and_load(self):
         self.generate_button.set_sensitive(True)
@@ -2296,12 +2049,6 @@ class AnimusGUI(Gtk.Window):
             weight_name_entry, weight_spin = self.lora_weight_entries[i]
             weight_name_entry.set_text("")
             weight_spin.set_value(0.5)
-
-        for embedding_entry, embedding_token_entry in zip(
-            self.embedding_entries, self.embedding_token_entries
-        ):
-            embedding_entry.set_text("")
-            embedding_token_entry.set_text("")
 
         self.width_spin.set_value(ANIMA_DEFAULT_SIZE)
         self.height_spin.set_value(ANIMA_DEFAULT_SIZE)
