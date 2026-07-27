@@ -11,5 +11,5 @@ pycairo>=1.29.0
 pygobject==3.48.2
 safetensors>=0.7.0
 tokenizers>=0.22.1
-tqdm==4.67.1
+tqdm==4.70.0
 transformers>=4.57.3,<5.6
