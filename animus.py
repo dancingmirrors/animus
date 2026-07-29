@@ -324,6 +324,14 @@ ANIMA_LATENT_RGB_FACTORS = [
 ANIMA_LATENT_RGB_BIAS = [-0.1835, -0.0868, -0.3360]
 
 
+def spin_value(spin):
+    return round(spin.get_value(), spin.get_digits())
+
+
+def spin_text(spin):
+    return f"{spin_value(spin):.{spin.get_digits()}f}"
+
+
 def build_anima_scheduler(sampler, base_scheduler, shift=None):
     config = dict(base_scheduler.config)
 
@@ -1154,9 +1162,9 @@ class AnimusGUI(Gtk.Window):
                 "model": self.model_entry.get_text(),
                 "loras": [],
                 "steps": int(self.steps_spin.get_value()),
-                "guidance": float(self.guidance_spin.get_value()),
+                "guidance": spin_value(self.guidance_spin),
                 "sampler": self.sampler_combo.get_active_id() or ANIMA_DEFAULT_SAMPLER,
-                "shift": float(self.shift_spin.get_value()),
+                "shift": spin_value(self.shift_spin),
                 "seed": int(self.seed_spin.get_value()),
                 "width": int(self.width_spin.get_value()),
                 "height": int(self.height_spin.get_value()),
@@ -1173,7 +1181,7 @@ class AnimusGUI(Gtk.Window):
                     {
                         "path": lora_entry.get_text(),
                         "weight_name": weight_name_entry.get_text(),
-                        "weight_value": weight_spin.get_value(),
+                        "weight_value": spin_value(weight_spin),
                     }
                 )
 
@@ -1604,7 +1612,7 @@ class AnimusGUI(Gtk.Window):
         ):
             lora_path = lora_entry.get_text().strip()
             weight_name = weight_name_entry.get_text().strip()
-            weight_value = weight_spin.get_value()
+            weight_value = spin_value(weight_spin)
             if lora_path:
                 loras_to_load.append(
                     {
@@ -1780,7 +1788,7 @@ class AnimusGUI(Gtk.Window):
             if slot >= len(self.lora_weight_entries):
                 continue
             _, weight_spin = self.lora_weight_entries[slot]
-            weights[adapter_name] = weight_spin.get_value()
+            weights[adapter_name] = spin_value(weight_spin)
         if not weights:
             return
         try:
@@ -1826,7 +1834,7 @@ class AnimusGUI(Gtk.Window):
             path = lora_entry.get_text().strip()
             if path:
                 name = weight_name_entry.get_text().strip()
-                loras.append(f"{path}/{name}@{weight_spin.get_value():g}")
+                loras.append(f"{path}/{name}@{spin_text(weight_spin)}")
         if loras:
             info.add_text("loras", ", ".join(loras))
         for key, value in params.items():
@@ -1862,11 +1870,13 @@ class AnimusGUI(Gtk.Window):
                 full_prompt = user_prompt
 
             steps = int(self.steps_spin.get_value())
-            guidance = float(self.guidance_spin.get_value())
+            guidance = spin_value(self.guidance_spin)
+            guidance_text = spin_text(self.guidance_spin)
             width = int(self.width_spin.get_value())
             height = int(self.height_spin.get_value())
             sampler = self.sampler_combo.get_active_id() or ANIMA_DEFAULT_SAMPLER
-            shift = float(self.shift_spin.get_value())
+            shift = spin_value(self.shift_spin)
+            shift_text = spin_text(self.shift_spin)
             seed = int(self.seed_spin.get_value())
             if seed < 0:
                 seed = random.randint(0, ANIMA_SEED_MAX)
@@ -1877,8 +1887,8 @@ class AnimusGUI(Gtk.Window):
             self._refresh_lora_weights()
 
             self.update_status(
-                f"Generating with Anima ({sampler}, shift {shift:.2f}) at "
-                f"{width}x{height} with {steps} steps, guidance {guidance}, "
+                f"Generating with Anima ({sampler}, shift {shift_text}) at "
+                f"{width}x{height} with {steps} steps, guidance {guidance_text}, "
                 f"and seed {seed}..."
             )
 
@@ -1913,9 +1923,9 @@ class AnimusGUI(Gtk.Window):
                     prompt=full_prompt,
                     negative_prompt=negative_prompt,
                     steps=steps,
-                    guidance=guidance,
+                    guidance=guidance_text,
                     sampler=sampler,
-                    shift=shift,
+                    shift=shift_text,
                     seed=seed,
                     size=f"{width}x{height}",
                 )
