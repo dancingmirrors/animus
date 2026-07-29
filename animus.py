@@ -1703,6 +1703,8 @@ class AnimusGUI(Gtk.Window):
         self.generate_button.show()
         self.stop_button.hide()
         self.stop_button.set_sensitive(False)
+        if self.current_image_path and not self.preview_shown:
+            self.delete_image_button.set_sensitive(True)
         return False
 
     def _enable_load(self):
@@ -1725,10 +1727,12 @@ class AnimusGUI(Gtk.Window):
         self.generating = True
         self.stop_event.clear()
         self.stop_click_count = 0
+        self.preview_shown = False
         self.generate_button.set_sensitive(False)
         self.generate_button.hide()
         self.stop_button.set_sensitive(True)
         self.stop_button.show()
+        self.delete_image_button.set_sensitive(False)
 
         self.generation_thread = threading.Thread(
             target=self.generate_image_thread, daemon=True
@@ -1892,7 +1896,6 @@ class AnimusGUI(Gtk.Window):
                 f"and seed {seed}..."
             )
 
-            self.preview_shown = False
             _set_anima_stop_check(lambda: self.stop_event.is_set())
             if self.preview_check.get_active():
                 _set_anima_step_hook(self._on_denoise_step)
