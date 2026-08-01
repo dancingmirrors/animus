@@ -286,7 +286,7 @@ NUM_LORA_SLOTS = 4
 
 ANIMA_COMPONENTS_REPO = "circlestone-labs/Anima-Base-v1.0-Diffusers"
 ANIMA_DEFAULT_DIT = (
-    "https://huggingface.co/Abiray/Anima-turbo-v1.0-GGUF/"
+    "https://huggingface.co/dancingmirrors/Anima/"
     "anima-turbo-v1.0-Q4_K_M.gguf"
 )
 ANIMA_DEFAULT_STEPS = 8
