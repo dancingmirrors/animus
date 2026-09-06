@@ -622,12 +622,12 @@ class NcnnUpscaler:
             raise RuntimeError(f"ncnn returned {status} from the network.")
         out = torch.from_numpy(numpy.array(result)).unsqueeze(0)
         t3 = time.perf_counter()
-        print(
-            f"upload {(t1 - t0) * 1e3:7.1f}ms | "
-            f"gpu {(t2 - t1) * 1e3:7.1f}ms | "
-            f"download {(t3 - t2) * 1e3:7.1f}ms",
-            flush=True,
-        )
+        #        print(
+        #            f"upload {(t1 - t0) * 1e3:7.1f}ms | "
+        #            f"gpu {(t2 - t1) * 1e3:7.1f}ms | "
+        #            f"download {(t3 - t2) * 1e3:7.1f}ms",
+        #            flush=True,
+        #        )
         return out
 
     def close(self):
