@@ -14,6 +14,7 @@ import errno
 import gc
 import json
 import math
+import queue
 import re
 import shlex
 import shutil
@@ -84,6 +85,10 @@ MODEL_DIR = DATA_DIR / "upscalers"
 MIN_FREE_DISK_MARGIN = 256 * 1024 * 1024
 WORKER_THREAD_TIMEOUT = 10.0
 FFMPEG_TERM_TIMEOUT = 5.0
+
+QUEUE_FRAMES = 3
+QUEUE_BYTES = 256 * 1024 * 1024
+PIPE_TARGET_BYTES = 1024 * 1024
 
 REAL_ESRGAN_RELEASES = "https://github.com/xinntao/Real-ESRGAN/releases/download"
 
@@ -487,6 +492,37 @@ def load_upscaler(path, device, channels_last=True, dtype=torch.float32):
 
 
 NCNN_MAGIC = 7767517
+NCNN_OPTION_ENV = "ANIMUS_NCNN_OPTIONS"
+
+_TRUTHY = ("", "1", "true", "yes", "on")
+_FALSY = ("0", "false", "no", "off")
+
+
+def ncnn_option_overrides():
+    raw = os.environ.get(NCNN_OPTION_ENV, "").strip()
+    if not raw:
+        return {}
+
+    overrides = {}
+    for item in raw.replace(";", ",").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        name, _, value = item.partition("=")
+        name, value = name.strip(), value.strip().lower()
+        if not (name.startswith("use_") or name in ("lightmode", "num_threads")):
+            print(f"Ignoring {NCNN_OPTION_ENV} entry '{item}': not an option.")
+            continue
+        if value in _TRUTHY:
+            overrides[name] = True
+        elif value in _FALSY:
+            overrides[name] = False
+        else:
+            try:
+                overrides[name] = int(value)
+            except ValueError:
+                print(f"Ignoring {NCNN_OPTION_ENV} entry '{item}': not a value.")
+    return overrides
 
 
 def write_ncnn_model(state_dict, param_path, bin_path):
@@ -562,7 +598,7 @@ def write_ncnn_model(state_dict, param_path, bin_path):
     with open(bin_path, "wb") as handle:
         for flagged, tensor in weights:
             if flagged:
-                handle.write(struct.pack("<I", 0))  # 0 => float32
+                handle.write(struct.pack("<I", 0))
             handle.write(
                 tensor.detach().to(torch.float32).contiguous().numpy().tobytes()
             )
@@ -587,10 +623,23 @@ class NcnnUpscaler:
             self.net.set_vulkan_device(int(gpu))
         if threads:
             self.net.opt.num_threads = int(threads)
+
+        for name, value in ncnn_option_overrides().items():
+            if not hasattr(self.net.opt, name):
+                print(f"This ncnn has no option '{name}', so it was skipped.")
+                continue
+            try:
+                setattr(self.net.opt, name, value)
+                print(f"ncnn option {name} = {value}.")
+            except Exception as e:
+                print(f"Could not set ncnn option {name} ({e}).")
+
         self.net.load_param(str(param_path))
         self.net.load_model(str(bin_path))
 
         self.on_gpu = bool(self.net.opt.use_vulkan_compute)
+
+        self._extract_into = True
 
         self._allocators = []
         if self.on_gpu:
@@ -604,31 +653,38 @@ class NcnnUpscaler:
                 self._allocators = [blob, staging]
             except Exception as e:
                 print(
-                    f"Could not hold on to the GPU allocators ({e}). NCNN will "
+                    f"Could not hold on to the GPU allocators ({e}). ncnn will "
                     "take and return them every frame instead."
                 )
 
     def __call__(self, frame):
-        import time
+        planes = frame[0].detach()
+        if planes.dtype is not torch.float32:
+            planes = planes.to(torch.float32)
+        planes = planes.contiguous()
+        source = planes.numpy()
 
-        t0 = time.perf_counter()
-        chw = frame[0].detach().to(torch.float32).cpu().contiguous().numpy()
-        t1 = time.perf_counter()
         extractor = self.net.create_extractor()
-        extractor.input("data", self._ncnn.Mat(chw))
-        status, result = extractor.extract("out")
-        t2 = time.perf_counter()
+        extractor.input("data", self._ncnn.Mat(source))
+
+        if self._extract_into:
+            result = self._ncnn.Mat()
+            try:
+                status = extractor.extract("out", result)
+            except TypeError as e:
+                print(
+                    f"This ncnn has no extract(blob, mat) ({e}), so every "
+                    "frame will be copied an extra time on the way out."
+                )
+                self._extract_into = False
+                status, result = extractor.extract("out")
+        else:
+            status, result = extractor.extract("out")
+
         if status != 0:
             raise RuntimeError(f"ncnn returned {status} from the network.")
-        out = torch.from_numpy(numpy.array(result)).unsqueeze(0)
-        t3 = time.perf_counter()
-        #        print(
-        #            f"upload {(t1 - t0) * 1e3:7.1f}ms | "
-        #            f"gpu {(t2 - t1) * 1e3:7.1f}ms | "
-        #            f"download {(t3 - t2) * 1e3:7.1f}ms",
-        #            flush=True,
-        #        )
-        return out
+
+        return torch.from_numpy(numpy.asarray(result)).unsqueeze(0)
 
     def close(self):
         try:
@@ -685,7 +741,7 @@ def load_ncnn_upscaler(weights, gpu=None, threads=0, fp16=True):
         scale,
         size_multiple,
         min_overlap,
-        f"{description} via NCNN ({where}, {precision})",
+        f"{description} via ncnn ({where}, {precision})",
     )
 
 
@@ -1126,6 +1182,34 @@ def container_for(encoder, chosen=DEFAULT_CONTAINER):
     return chosen if chosen in dict(CONTAINERS) else DEFAULT_CONTAINER
 
 
+def grow_pipe(stream, wanted=PIPE_TARGET_BYTES):
+    try:
+        import fcntl
+    except ImportError:
+        return 0
+
+    setter = getattr(fcntl, "F_SETPIPE_SZ", 1031)
+    try:
+        descriptor = stream.fileno()
+    except Exception:
+        return 0
+
+    ceiling = wanted
+    try:
+        with open("/proc/sys/fs/pipe-max-size") as handle:
+            ceiling = min(wanted, int(handle.read().strip()))
+    except Exception:
+        pass
+
+    size = max(ceiling, 65536)
+    while size >= 65536:
+        try:
+            return int(fcntl.fcntl(descriptor, setter, size))
+        except (OSError, ValueError):
+            size //= 2
+    return 0
+
+
 def read_exact(stream, buffer):
     view = memoryview(buffer)
     filled = 0
@@ -1146,6 +1230,21 @@ def write_exact(stream, data):
         view = view[written:]
 
 
+STAGE_NAMES = ("decode", "prepare", "network", "convert", "encode")
+
+
+def new_profile():
+    return {name: 0.0 for name in STAGE_NAMES}
+
+
+def describe_profile(profile, frames):
+    if not frames:
+        return ""
+    parts = [f"{name} {profile[name] / frames * 1e3:.0f} ms" for name in STAGE_NAMES]
+    total = sum(profile.values()) / frames * 1e3
+    return f"Per frame: {' | '.join(parts)}  (measured total {total:.0f} ms)."
+
+
 def process_stream(
     model,
     source,
@@ -1161,65 +1260,145 @@ def process_stream(
     channels_last=True,
     stop_check=None,
     on_frame=None,
+    profile=None,
 ):
     device = torch.device(device)
     frame_bytes = width * height * 3
-    buffer = bytearray(frame_bytes)
+    memory_format = torch.channels_last if channels_last else torch.contiguous_format
+
+    if profile is None:
+        profile = new_profile()
+
+    def depth(each):
+        return max(1, min(QUEUE_FRAMES, QUEUE_BYTES // max(each, 1)))
+
+    reads = queue.Queue(maxsize=depth(frame_bytes))
+    writes = queue.Queue(maxsize=depth(frame_bytes * scale * scale))
+    stopping = threading.Event()
+    failures = []
+    delivered = [0]
+
+    def offer(destination, item):
+        while not stopping.is_set():
+            try:
+                destination.put(item, timeout=0.25)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def pump():
+        try:
+            while not stopping.is_set() and (stop_check is None or not stop_check()):
+                buffer = bytearray(frame_bytes)
+                got = read_exact(source, buffer)
+                if got == 0:
+                    break
+                if got < frame_bytes:
+                    print(
+                        f"Warning: the decoder stopped {frame_bytes - got} bytes "
+                        "into a frame. Treating that as the end of the stream."
+                    )
+                    break
+                if not offer(reads, buffer):
+                    return
+        except Exception as e:
+            failures.append(e)
+        offer(reads, None)
+
+    def drain():
+        while True:
+            item = writes.get()
+            if item is None:
+                return
+            if failures:
+                continue
+            try:
+                write_exact(sink, item)
+                delivered[0] += 1
+            except Exception as e:
+                failures.append(e)
+
+    reader = threading.Thread(target=pump, name="animus-decode", daemon=True)
+    writer = threading.Thread(target=drain, name="animus-encode", daemon=True)
+    reader.start()
+    writer.start()
+
+    clock = time.perf_counter
     written = 0
 
-    while stop_check is None or not stop_check():
-        got = read_exact(source, buffer)
-        if got == 0:
-            break
-        if got < frame_bytes:
-            print(
-                f"Warning: the decoder stopped {frame_bytes - got} bytes into a "
-                "frame. Treating that as the end of the stream."
-            )
-            break
-
-        frame = (
-            torch.frombuffer(buffer, dtype=torch.uint8)
-            .reshape(height, width, 3)
-            .permute(2, 0, 1)
-            .unsqueeze(0)
-            .to(device=device, dtype=dtype)
-            .div_(255.0)
-        )
-        if channels_last:
-            frame = frame.contiguous(memory_format=torch.channels_last)
-
-        with torch.inference_mode():
-            result = upscale_frame(
-                model,
-                frame,
-                scale,
-                tile,
-                tile_pad,
-                size_multiple=size_multiple,
-                stop_check=stop_check,
-            )
-            if result is None:
+    try:
+        while stop_check is None or not stop_check():
+            mark = clock()
+            buffer = reads.get()
+            profile["decode"] += clock() - mark
+            if buffer is None or failures:
                 break
-            rgb = (
-                result[0]
-                .mul_(255.0)
-                .round_()
-                .clamp_(0.0, 255.0)
-                .to(torch.uint8)
-                .permute(1, 2, 0)
-                .contiguous()
-                .cpu()
+
+            mark = clock()
+            frame = (
+                torch.frombuffer(buffer, dtype=torch.uint8)
+                .reshape(height, width, 3)
+                .permute(2, 0, 1)
+                .unsqueeze(0)
+                .contiguous(memory_format=memory_format)
+                .to(device=device, dtype=dtype)
+                .div_(255.0)
             )
-            if on_frame is not None:
-                on_frame(written + 1, rgb)
+            profile["prepare"] += clock() - mark
 
-        del frame, result
-        write_exact(sink, rgb.numpy())
-        del rgb
-        written += 1
+            with torch.inference_mode():
+                mark = clock()
+                result = upscale_frame(
+                    model,
+                    frame,
+                    scale,
+                    tile,
+                    tile_pad,
+                    size_multiple=size_multiple,
+                    stop_check=stop_check,
+                )
+                profile["network"] += clock() - mark
+                if result is None:
+                    break
 
-    return written
+                mark = clock()
+                planes = result[0].mul_(255.0).round_().clamp_(0.0, 255.0)
+                rgb = torch.empty(
+                    (planes.shape[1], planes.shape[2], 3), dtype=torch.uint8
+                )
+                rgb.copy_(planes.permute(1, 2, 0))
+
+                if on_frame is not None:
+                    on_frame(written + 1, rgb)
+                profile["convert"] += clock() - mark
+
+            del frame, result, planes, buffer
+
+            mark = clock()
+            handed = offer(writes, rgb.numpy())
+            profile["encode"] += clock() - mark
+            del rgb
+            if not handed:
+                break
+            written += 1
+    finally:
+        while writer.is_alive():
+            try:
+                writes.put(None, timeout=1.0)
+                break
+            except queue.Full:
+                continue
+
+        writer.join()
+
+        stopping.set()
+        reader.join(timeout=0.25)
+
+    if failures:
+        raise failures[0]
+
+    return delivered[0]
 
 
 def terminate_process(process, timeout=FFMPEG_TERM_TIMEOUT):
@@ -1250,7 +1429,6 @@ def cpu_flags():
 
 
 CPU_FLAGS = cpu_flags()
-# Without one of these, bfloat16 is emulated and costs more than float32.
 BF16_IN_HARDWARE = bool(CPU_FLAGS & {"amx_bf16", "avx512_bf16"})
 
 
@@ -1866,10 +2044,10 @@ class UpscaleGUI(Gtk.Window):
         finally:
             self._loading_settings = False
 
-        if isinstance(settings, dict):
-            for key, value in self._auto_knobs().items():
-                if key in settings and self._read_knob(key) != value:
-                    self._user_set.add(key)
+        remembered = settings.get("user_set") if isinstance(settings, dict) else None
+        if isinstance(remembered, list):
+            automatic = self._auto_knobs()
+            self._user_set.update(key for key in remembered if key in automatic)
 
         self.on_model_changed()
         self.on_encoder_changed()
@@ -1888,6 +2066,7 @@ class UpscaleGUI(Gtk.Window):
                 "threads": int(self.threads_spin.get_value()),
                 "tile": int(self.tile_spin.get_value()),
                 "tile_pad": int(self.tile_pad_spin.get_value()),
+                "user_set": sorted(self._user_set),
                 "channels_last": self.channels_last_check.get_active(),
                 "deinterlace": self.deinterlace_check.get_active(),
                 "compile": self.compile_check.get_active(),
@@ -2208,7 +2387,7 @@ class UpscaleGUI(Gtk.Window):
         precision = self.precision_combo.get_active_id() or DEFAULT_PRECISION
         if device.startswith("ncnn:") and precision == "bfloat16":
             print(
-                "NCNN's Vulkan path has no bfloat16 here. Using float16, "
+                "ncnn's Vulkan path has no bfloat16 here. Using float16, "
                 "which is what a GPU wants anyway."
             )
         if device == "cpu" and precision == "bfloat16":
@@ -2435,6 +2614,21 @@ class UpscaleGUI(Gtk.Window):
                         "Tile and Overlap if there is memory for it."
                     )
 
+            if tile > 0:
+                self.update_status(
+                    f"Working in {tile} px tiles with {tile_pad} px of overlap."
+                )
+                if on_ncnn:
+                    self.update_status(
+                        "On a GPU that is usually the wrong trade. Every tile "
+                        "is a separate upload, dispatch and download, and the "
+                        f"{tile_pad} px of overlap is computed twice along "
+                        "every seam. Set Tile to 0 unless the card runs out of "
+                        "memory."
+                    )
+            else:
+                self.update_status("Working on whole frames.")
+
             if self.stop_event.is_set():
                 raise KeyboardInterrupt()
 
@@ -2520,6 +2714,14 @@ class UpscaleGUI(Gtk.Window):
                 stdin=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
+            inbound = grow_pipe(self.decoder.stdout)
+            outbound = grow_pipe(self.encoder.stdin)
+            if inbound or outbound:
+                print(
+                    f"Pipe buffers: {_format_size(inbound)} in from the decoder, "
+                    f"{_format_size(outbound)} out to the encoder."
+                )
+
             self._muxed_bytes = 0
             self._drain(self.decoder.stderr)
             encoder_errors = self._drain(self.encoder.stderr, progress=True)
@@ -2533,6 +2735,7 @@ class UpscaleGUI(Gtk.Window):
                     GLib.idle_add(self._show_preview, *preview)
                 self._report_progress(index, total, started)
 
+            profile = new_profile()
             try:
                 frames_done = process_stream(
                     model,
@@ -2549,6 +2752,7 @@ class UpscaleGUI(Gtk.Window):
                     channels_last=channels_last,
                     stop_check=stop_check,
                     on_frame=on_frame,
+                    profile=profile,
                 )
             except BrokenPipeError:
                 raise RuntimeError(
@@ -2582,6 +2786,9 @@ class UpscaleGUI(Gtk.Window):
             rate = frames_done / elapsed if elapsed > 0 else 0.0
             self.current_output = job["dest"]
 
+            breakdown = describe_profile(profile, frames_done)
+            if breakdown:
+                print(breakdown)
             if stopped:
                 self.update_status(
                     f"Stopped after {frames_done} frames. {job['dest']} holds "
@@ -2928,12 +3135,12 @@ def measure_reach(model, scale, size_multiple, expected):
     margin = expected + 4
     size = 2 * margin
     size += (-size) % max(size_multiple, 1)
-    centre = size // 2
-    centre -= centre % max(size_multiple, 1)
+    center = size // 2
+    center -= center % max(size_multiple, 1)
 
     base = torch.rand(1, 3, size, size)
     probed = base.clone()
-    probed[0, :, centre, centre] += 10.0
+    probed[0, :, center, center] += 10.0
 
     with torch.inference_mode():
         difference = (model(probed) - model(base)).abs().sum(dim=1)[0] != 0
@@ -2945,7 +3152,7 @@ def measure_reach(model, scale, size_multiple, expected):
 
     top, bottom = int(rows[0]) // scale, int(rows[-1]) // scale
     left, right = int(cols[0]) // scale, int(cols[-1]) // scale
-    reach = max(centre - top, bottom - centre, centre - left, right - centre)
+    reach = max(center - top, bottom - center, center - left, right - center)
     clipped = top <= 0 or left <= 0 or bottom >= size - 1 or right >= size - 1
     return reach, clipped
 
@@ -3006,8 +3213,10 @@ def benchmark(target=None):
                 path, "cpu", channels_last=True
             )
 
+        probe = frame if device == "cpu" else frame.contiguous()
+
         def once():
-            return upscale_frame(model, frame, scale, tile, overlap, multiple)
+            return upscale_frame(model, probe, scale, tile, overlap, multiple)
 
         with torch.inference_mode():
             started = time.monotonic()
