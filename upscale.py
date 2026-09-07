@@ -977,15 +977,24 @@ def source_filters(deinterlace, extra_filters):
     return ",".join(filters)
 
 
-def probe_filtered_size(path, filters):
+def output_filters(model_width, model_height, out_width, out_height, extra_filters):
+    filters = []
+    if (out_width, out_height) != (model_width, model_height):
+        filters.append(f"scale={out_width}:{out_height}:flags=lanczos")
+    extra_filters = (extra_filters or "").strip()
+    if extra_filters:
+        filters.append(extra_filters)
+    return ",".join(filters)
+
+
+def _probe_size(source, filters):
     command = [
         "ffmpeg",
         "-hide_banner",
         "-nostdin",
         "-loglevel",
         "info",
-        "-i",
-        str(path),
+        *source,
         "-vf",
         f"{filters or 'null'},showinfo",
         "-frames:v",
@@ -1010,6 +1019,14 @@ def probe_filtered_size(path, filters):
         return None
     width, height = found[-1]
     return int(width), int(height)
+
+
+def probe_filtered_size(path, filters):
+    return _probe_size(["-i", str(path)], filters)
+
+
+def probe_output_size(width, height, filters):
+    return _probe_size(["-f", "lavfi", "-i", f"color=s={width}x{height}"], filters)
 
 
 def build_decoder_command(info, start, limit, deinterlace, extra_filters):
@@ -1043,6 +1060,7 @@ def build_encoder_command(
     audio,
     start,
     limit,
+    extra_filters,
 ):
     command = [
         "ffmpeg",
@@ -1078,8 +1096,11 @@ def build_encoder_command(
     else:
         command += ["-map", "0:v:0", "-an"]
 
-    if (out_width, out_height) != (model_width, model_height):
-        command += ["-vf", f"scale={out_width}:{out_height}:flags=lanczos"]
+    filters = output_filters(
+        model_width, model_height, out_width, out_height, extra_filters
+    )
+    if filters:
+        command += ["-vf", filters]
 
     if encoder == "ffv1":
         command += ["-c:v", "ffv1", "-level", "3", "-pix_fmt", "gbrp"]
@@ -1628,12 +1649,14 @@ class UpscaleGUI(Gtk.Window):
         grid.attach(self.precision_combo, 1, row, 2, 1)
         row += 1
 
-        grid.attach(self._label("Extra -vf:"), 0, row, 1, 1)
-        self.filters_entry = Gtk.Entry()
-        self.filters_entry.set_placeholder_text(
-            "Optional ffmpeg filters applied before upscaling, e.g. hqdn3d=2:1:3:3"
-        )
-        grid.attach(self.filters_entry, 1, row, 4, 1)
+        grid.attach(self._label("Extra -vf before:"), 0, row, 1, 1)
+        self.filters_pre_entry = Gtk.Entry()
+        grid.attach(self.filters_pre_entry, 1, row, 5, 1)
+        row += 1
+
+        grid.attach(self._label("Extra -vf after:"), 0, row, 1, 1)
+        self.filters_post_entry = Gtk.Entry()
+        grid.attach(self.filters_post_entry, 1, row, 5, 1)
         row += 1
 
         grid.attach(self._label("Encoder:"), 0, row, 1, 1)
@@ -1820,8 +1843,14 @@ class UpscaleGUI(Gtk.Window):
                 if settings.get("precision") in PRECISION_DTYPES:
                     self.precision_combo.set_active_id(settings["precision"])
 
-                if "filters" in settings:
-                    self.filters_entry.set_text(settings["filters"])
+                for key, entry in (
+                    ("filters", self.filters_pre_entry),
+                    ("filters_pre", self.filters_pre_entry),
+                    ("filters_post", self.filters_post_entry),
+                ):
+                    if key in settings:
+                        entry.set_text(settings[key])
+
                 if settings.get("encoder") in [e[0] for e in ENCODERS]:
                     self.encoder_combo.set_active_id(settings["encoder"])
                 if settings.get("encoder_preset") in X264_PRESETS:
@@ -1865,7 +1894,8 @@ class UpscaleGUI(Gtk.Window):
                 "precision": (
                     self.precision_combo.get_active_id() or DEFAULT_PRECISION
                 ),
-                "filters": self.filters_entry.get_text(),
+                "filters_pre": self.filters_pre_entry.get_text(),
+                "filters_post": self.filters_post_entry.get_text(),
                 "encoder": self.encoder_combo.get_active_id() or DEFAULT_ENCODER,
                 "encoder_preset": (
                     self.preset_encoder_combo.get_active_id() or DEFAULT_ENCODER_PRESET
@@ -2126,7 +2156,8 @@ class UpscaleGUI(Gtk.Window):
         self.deinterlace_check.set_active(False)
         self.compile_check.set_active(False)
         self.precision_combo.set_active_id(DEFAULT_PRECISION)
-        self.filters_entry.set_text("")
+        self.filters_pre_entry.set_text("")
+        self.filters_post_entry.set_text("")
         self.encoder_combo.set_active_id(DEFAULT_ENCODER)
         self.preset_encoder_combo.set_active_id(DEFAULT_ENCODER_PRESET)
         self.crf_spin.set_value(DEFAULT_CRF)
@@ -2212,7 +2243,8 @@ class UpscaleGUI(Gtk.Window):
             "tile_pad": int(self.tile_pad_spin.get_value()),
             "channels_last": self.channels_last_check.get_active(),
             "deinterlace": self.deinterlace_check.get_active(),
-            "filters": self.filters_entry.get_text(),
+            "filters_pre": self.filters_pre_entry.get_text(),
+            "filters_post": self.filters_post_entry.get_text(),
             "encoder": encoder,
             "encoder_preset": (
                 self.preset_encoder_combo.get_active_id() or DEFAULT_ENCODER_PRESET
@@ -2407,7 +2439,7 @@ class UpscaleGUI(Gtk.Window):
                 raise KeyboardInterrupt()
 
             source_width, source_height = info["width"], info["height"]
-            filters = source_filters(job["deinterlace"], job["filters"])
+            filters = source_filters(job["deinterlace"], job["filters_pre"])
             if filters:
                 measured = probe_filtered_size(info["path"], filters)
                 if measured is None:
@@ -2432,11 +2464,30 @@ class UpscaleGUI(Gtk.Window):
                     f"will resample that to {out_width}x{out_height} (lanczos)."
                 )
 
+            post_filters = (job["filters_post"] or "").strip()
+            if post_filters:
+                measured = probe_output_size(out_width, out_height, post_filters)
+                if measured is None:
+                    print(
+                        "Warning: could not measure the frame size after "
+                        f"'{post_filters}'. FFmpeg will apply it anyway."
+                    )
+                elif measured != (out_width, out_height):
+                    self.update_status(
+                        f"'{post_filters}' runs after the upscale, so the file "
+                        f"ends up {measured[0]}x{measured[1]}, not "
+                        f"{out_width}x{out_height}."
+                    )
+
             total = self._expected_frames(info, job["start"], job["limit"])
             self._total_label = str(total) if info["frames_exact"] else f"~{total}"
 
             decoder_command = build_decoder_command(
-                info, job["start"], job["limit"], job["deinterlace"], job["filters"]
+                info,
+                job["start"],
+                job["limit"],
+                job["deinterlace"],
+                job["filters_pre"],
             )
             encoder_command = build_encoder_command(
                 info,
@@ -2452,6 +2503,7 @@ class UpscaleGUI(Gtk.Window):
                 job["audio"],
                 job["start"],
                 job["limit"],
+                job["filters_post"],
             )
             print(f"decode: {shlex.join(decoder_command)}")
             print(f"encode: {shlex.join(encoder_command)}")
@@ -2783,6 +2835,14 @@ def _self_test_pipeline(check):
             probe_filtered_size(source, "not_a_real_filter=1") is None,
         )
 
+        for filters, want in (
+            ("", (128, 96)),
+            ("crop=100:80:0:0", (100, 80)),
+            ("scale=64:48:flags=lanczos,crop=32:24:0:0", (32, 24)),
+        ):
+            got = probe_output_size(128, 96, filters)
+            check(f"128x96 after '{filters or 'no filters'}'", got == want, str(got))
+
         info = probe_video(source)
         check(
             "ffprobe reads the clip",
@@ -2824,6 +2884,7 @@ def _self_test_pipeline(check):
                 "copy",
                 0,
                 0,
+                "",
             ),
             stdin=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -3153,6 +3214,24 @@ def self_test():
             {"width": width, "height": height}, preset, custom_w, custom_h
         )
         check(f"target_size {preset} from {width}x{height}", got == want, str(got))
+
+    chains = (
+        ("nothing to do", (128, 96, 128, 96, ""), ""),
+        (
+            "the extra chain alone",
+            (128, 96, 128, 96, "crop=100:80:0:0"),
+            "crop=100:80:0:0",
+        ),
+        ("the resample alone", (128, 96, 64, 48, ""), "scale=64:48:flags=lanczos"),
+        (
+            "the resample and then the extra chain",
+            (128, 96, 64, 48, "crop=32:24:0:0"),
+            "scale=64:48:flags=lanczos,crop=32:24:0:0",
+        ),
+    )
+    for label, arguments, want in chains:
+        got = output_filters(*arguments)
+        check(f"output filters: {label}", got == want, got or "(none)")
 
     _self_test_ncnn(check)
 
