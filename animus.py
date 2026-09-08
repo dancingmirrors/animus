@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 # autopep8: off
+# isort: off
 
 import os
 import sys
@@ -71,7 +72,7 @@ try:
     )
 
     ANIMA_AVAILABLE = True
-except Exception:  # pragma: Requires diffusers >= 0.39.0.
+except Exception:  # pragma: Requires diffusers >= 0.39.0.  # noqa: BLE001
     ModularPipeline = None
     CosmosTransformer3DModel = None
     GGUFQuantizationConfig = None
@@ -81,10 +82,10 @@ except Exception:  # pragma: Requires diffusers >= 0.39.0.
 
 try:
     from diffusers import ClassifierFreeGuidance
-except Exception:
+except Exception:  # noqa: BLE001
     try:
         from diffusers.guiders import ClassifierFreeGuidance
-    except Exception:
+    except Exception:  # noqa: BLE001
         ClassifierFreeGuidance = None
 
 from PIL import Image as _PILImage
@@ -127,7 +128,7 @@ try:
     tqdm_module.tqdm.__init__ = _patched_tqdm_init
 except (ImportError, AttributeError) as e:
     print(f"Warning: Could not patch tqdm: {e}.", file=sys.stderr)
-except Exception as e:
+except Exception as e:  # noqa: BLE001
     print(f"Warning: unexpected error while patching tqdm: {e}.", file=sys.stderr)
 
 APP_NAME = "animus"
@@ -380,7 +381,13 @@ _gui_instance = None
 _anima_step_hook = None
 _anima_stop_check = None
 
+# isort: on
 # autopep8: on
+
+
+# Raised when the Anima pipeline cannot be prepared.
+class AnimaError(Exception):
+    pass
 
 
 def raise_exception_in_thread(thread_obj):
@@ -393,7 +400,7 @@ def raise_exception_in_thread(thread_obj):
             if tobj is thread_obj:
                 thread_id = tid
                 break
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"Warning: Could not access thread ID: {e}.")
         return False
 
@@ -438,10 +445,11 @@ def _install_cosmos_torchvision_shim():
         import torchvision  # noqa: F401
 
         return  # Nothing to shim.
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     try:
         import types
+
         from diffusers.models.transformers import transformer_cosmos
 
         if getattr(transformer_cosmos, "transforms", None) is not None:
@@ -471,7 +479,7 @@ def _install_cosmos_torchvision_shim():
             "Using a resize shim for the Cosmos padding mask "
             "since torchvision isn't installed."
         )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"Warning: could not install the Cosmos torchvision shim: {e}.")
 
 
@@ -507,16 +515,16 @@ def _install_anima_denoise_hook():
                     bs = block_state
                     try:
                         _components, bs = result
-                    except Exception:
+                    except Exception:  # noqa: BLE001, S110
                         pass
                     hook(getattr(bs, "latents", None), kwargs.get("i"))
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
             return result
 
         wrapper.loop_step = _patched_loop_step
         wrapper._animus_hooked = True
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"Warning: could not install the preview hook: {e}.")
 
 
@@ -542,11 +550,11 @@ def is_huggingface_repo(path_str):
         return False
 
     parts = path_str.split("/")
-    if len(parts) == 2 and not path_str.startswith((".", "/")):
-        if not any(c in path_str for c in ["\\", "~"]):
-            return True
-
-    return False
+    return (
+        len(parts) == 2
+        and not path_str.startswith((".", "/"))
+        and not any(c in path_str for c in ["\\", "~"])
+    )
 
 
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
@@ -649,7 +657,7 @@ class AnimusGUI(Gtk.Window):
             from transformers import AutoTokenizer
 
             self.tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"Warning: Could not load the tokenizer for token counting: {e}.")
             self.tokenizer = None
 
@@ -988,7 +996,7 @@ class AnimusGUI(Gtk.Window):
             style_context.add_provider(
                 css_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"Could not set monospace font: {e}.")
 
         self.console_buffer = self.console_text.get_buffer()
@@ -1040,7 +1048,7 @@ class AnimusGUI(Gtk.Window):
             return 0
         try:
             return len(self.tokenizer.encode(text, add_special_tokens=False))
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"Error counting tokens: {e}.")
             return 0
 
@@ -1133,7 +1141,7 @@ class AnimusGUI(Gtk.Window):
                     self.neg_prompt_text.get_buffer().set_text(
                         settings["negative_prompt"]
                     )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"Error loading settings: {e}.")
         finally:
             self._loading_settings = False
@@ -1188,7 +1196,7 @@ class AnimusGUI(Gtk.Window):
 
             with open(CONFIG_FILE, "w") as f:
                 json.dump(settings, f, indent=2)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"Error saving settings: {e}!")
 
     def _copy_to_library(self, src_path, dest_file, description):
@@ -1244,7 +1252,7 @@ class AnimusGUI(Gtk.Window):
                 print(f"Failed to copy {description}: {e}!")
             self._discard_partial_copy(dest_file)
             return False
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"Failed to copy {description}: {e}!")
             self._discard_partial_copy(dest_file)
             return False
@@ -1431,12 +1439,12 @@ class AnimusGUI(Gtk.Window):
                 self.pipe = None
                 gc.collect()
             GLib.idle_add(self._enable_load)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             if self.stop_event.is_set():
                 self.update_status("Interrupted by user.")
             else:
                 traceback.print_exc()
-                self.update_status(f"Error loading model: {str(e)}!")
+                self.update_status(f"Error loading model: {e}!")
             GLib.idle_add(self._enable_load)
         finally:
             self.loading_model = False
@@ -1444,14 +1452,14 @@ class AnimusGUI(Gtk.Window):
 
     def _load_anima_pipeline(self, dit_source):
         if not ANIMA_AVAILABLE:
-            raise Exception("Anima requires diffusers >= 0.39.0 and gguf.")
+            raise AnimaError("Anima requires diffusers >= 0.39.0 and gguf.")
 
         _install_cosmos_torchvision_shim()
         _install_anima_denoise_hook()
 
         dit_source = normalize_huggingface_url((dit_source or "").strip())
         if not dit_source:
-            raise Exception("No Anima DiT specified.")
+            raise AnimaError("No Anima DiT specified.")
 
         self.update_status(f"Loading Anima DiT " f"from {dit_source}...")
         transformer = CosmosTransformer3DModel.from_single_file(
@@ -1483,7 +1491,7 @@ class AnimusGUI(Gtk.Window):
             if other:
                 pipe.load_components(names=other, torch_dtype=torch.float32)
                 loaded_selectively = True
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(
                 f"Warning: selective component load failed: {e}. "
                 "Loading all components."
@@ -1508,12 +1516,12 @@ class AnimusGUI(Gtk.Window):
                 if hasattr(vae, "enable_tiling"):
                     vae.enable_tiling()
                     self.update_status("Enabled VAE tiling and slicing.")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"Warning: {e}.")
 
         try:
             pipe.to("cpu")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"Warning: could not move pipeline to CPU: {e}.")
 
         self._base_scheduler = getattr(pipe, "scheduler", None)
@@ -1530,7 +1538,7 @@ class AnimusGUI(Gtk.Window):
                     return candidate
             if p.is_file():
                 return p
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
         return None
 
@@ -1660,11 +1668,11 @@ class AnimusGUI(Gtk.Window):
 
                 adapter_weights[lora_info["adapter_name"]] = lora_info["weight_value"]
                 self._loaded_adapters[lora_info["adapter_name"]] = lora_info["slot"]
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 traceback.print_exc()
                 self.update_status(
                     f"Warning: could not load LoRA {lora_info['adapter_name']} "
-                    f"({label}): {str(e)}. Skipping."
+                    f"({label}): {e}. Skipping."
                 )
 
         if not adapter_weights:
@@ -1678,12 +1686,12 @@ class AnimusGUI(Gtk.Window):
             )
             try:
                 active = self.pipe.get_active_adapters()
-            except Exception:
+            except Exception:  # noqa: BLE001
                 active = list(adapter_weights.keys())
             self.update_status(f"Activated LoRA(s) at runtime: {active}.")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             traceback.print_exc()
-            self.update_status(f"Warning: could not activate LoRA adapters: {str(e)}.")
+            self.update_status(f"Warning: could not activate LoRA adapters: {e}.")
 
     def _enable_generate_and_load(self):
         self.generate_button.set_sensitive(True)
@@ -1773,14 +1781,14 @@ class AnimusGUI(Gtk.Window):
             scheduler = build_anima_scheduler(sampler, base, shift)
             bind_scheduler_generator(scheduler, generator)
             self.pipe.update_components(scheduler=scheduler)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(
                 f"Warning: could not select sampler '{sampler}': {e}. "
                 "Falling back to the pipeline default."
             )
             try:
                 self.pipe.update_components(scheduler=base)
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
 
     def _refresh_lora_weights(self):
@@ -1798,7 +1806,7 @@ class AnimusGUI(Gtk.Window):
             self.pipe.set_adapters(
                 list(weights.keys()), adapter_weights=list(weights.values())
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"Warning: could not update the LoRA strengths: {e}.")
 
     def _apply_guidance(self, guidance):
@@ -1816,11 +1824,7 @@ class AnimusGUI(Gtk.Window):
             else:
                 guider = ClassifierFreeGuidance(guidance_scale=float(guidance))
             self.pipe.update_components(guider=guider)
-            try:
-                active = self.pipe.guider.guidance_scale
-            except Exception:
-                active = guidance
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(
                 f"Warning: could not apply guidance {guidance} to the guider "
                 f"component: {e}. The pipeline's default CFG will be used."
@@ -1919,7 +1923,7 @@ class AnimusGUI(Gtk.Window):
             if self.stop_event.is_set():
                 self.update_status("Interrupted by user.")
             elif image is not None:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                timestamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
                 output_path = OUTPUT_DIR / f"animus_{timestamp}.png"
                 info = self._png_metadata(
                     prompt=full_prompt,
@@ -1941,12 +1945,12 @@ class AnimusGUI(Gtk.Window):
         except KeyboardInterrupt:
             self.update_status("Interrupted by user.")
             GLib.idle_add(self._reset_generate_button)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             if self.stop_event.is_set():
                 self.update_status("Interrupted by user.")
             else:
                 traceback.print_exc()
-                self.update_status(f"Error generating image: {str(e)}")
+                self.update_status(f"Error generating image: {e}")
         finally:
             _set_anima_step_hook(None)
             _set_anima_stop_check(None)
@@ -1962,7 +1966,7 @@ class AnimusGUI(Gtk.Window):
                 return
             rgb_bytes, width, height = data
             GLib.idle_add(self._show_preview, rgb_bytes, width, height)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"Preview failed: {e}.", file=sys.stderr)
 
     def _latents_to_rgb_bytes(self, latents):
@@ -1984,7 +1988,7 @@ class AnimusGUI(Gtk.Window):
                 rgb = ((rgb + 1.0) * 0.5 * 255.0).clamp(0, 255).to(torch.uint8)
                 height, width, _ = rgb.shape
                 return rgb.contiguous().numpy().tobytes(), width, height
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"Preview projection failed: {e}.", file=sys.stderr)
             return None
 
@@ -2001,8 +2005,8 @@ class AnimusGUI(Gtk.Window):
             if longest < PREVIEW_DISPLAY_SIZE:
                 scale = PREVIEW_DISPLAY_SIZE / longest
                 pixbuf = pixbuf.scale_simple(
-                    int(round(width * scale)),
-                    int(round(height * scale)),
+                    round(width * scale),
+                    round(height * scale),
                     GdkPixbuf.InterpType.BILINEAR,
                 )
 
@@ -2011,7 +2015,7 @@ class AnimusGUI(Gtk.Window):
             if not self.preview_shown:
                 self.preview_shown = True
                 self.notebook.set_current_page(1)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"Could not display preview: {e}.", file=sys.stderr)
 
         return False
@@ -2027,7 +2031,7 @@ class AnimusGUI(Gtk.Window):
             self.current_image_path = path
             self.delete_image_button.set_sensitive(True)
             self.notebook.set_current_page(1)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"Error displaying image: {e}.", file=sys.stderr)
         return False
 
@@ -2047,7 +2051,7 @@ class AnimusGUI(Gtk.Window):
                     print(f"Image file no longer exists: " f"{self.current_image_path}")
                     self.update_status("Image file no longer exists.")
                 self._clear_image_display()
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 error_msg = f"Error deleting image: {e}."
                 print(error_msg, file=sys.stderr)
                 self.update_status(error_msg)
@@ -2115,10 +2119,9 @@ def main():
         Gtk.main()
     except KeyboardInterrupt:
         print("\nKeyboardInterrupt received - shutting down...")
-        if _gui_instance:
-            if _gui_instance.generating or _gui_instance.loading_model:
-                print("Stopping operations...")
-                _gui_instance.stop_event.set()
+        if _gui_instance and (_gui_instance.generating or _gui_instance.loading_model):
+            print("Stopping operations...")
+            _gui_instance.stop_event.set()
         sys.exit(0)
 
 

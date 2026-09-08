@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 # autopep8: off
+# isort: off
 
 import os
 import sys
@@ -62,6 +63,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+# isort: on
 # autopep8: on
 
 APP_NAME = "animus"
@@ -225,9 +227,9 @@ def _format_size(num_bytes):
 
 
 def _format_duration(seconds):
-    if seconds is None or seconds != seconds or seconds < 0:
+    if seconds is None or not math.isfinite(seconds) or seconds < 0:
         return "--:--:--"
-    seconds = int(round(seconds))
+    seconds = round(seconds)
     hours, seconds = divmod(seconds, 3600)
     minutes, seconds = divmod(seconds, 60)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
@@ -238,7 +240,7 @@ def spin_value(spin):
 
 
 def even(value):
-    value = int(round(value))
+    value = round(value)
     return max(2, value - (value % 2))
 
 
@@ -380,7 +382,7 @@ def read_state_dict(path):
             break
 
     if not isinstance(state_dict, dict):
-        raise ValueError(f"{path.name} does not hold a state dict.")
+        raise TypeError(f"{path.name} does not hold a state dict.")
 
     return {re.sub(r"^module\.", "", k): v for k, v in state_dict.items()}
 
@@ -452,7 +454,7 @@ def build_upscaler(state_dict):
     if num_conv < 0 or last != 2 + 2 * num_conv:
         raise ValueError(f"Unexpected SRVGG body layout (last conv at {last}).")
 
-    upscale = int(round(math.sqrt(out_planes / max(num_in_ch, 1))))
+    upscale = round(math.sqrt(out_planes / max(num_in_ch, 1)))
     if upscale < 1 or num_in_ch * upscale * upscale != out_planes:
         raise ValueError(
             f"Cannot derive the scale from a {out_planes}-channel final conv."
@@ -528,7 +530,7 @@ def ncnn_option_overrides():
 def write_ncnn_model(state_dict, param_path, bin_path):
     model, scale, size_multiple, min_overlap, description = build_upscaler(state_dict)
     if not isinstance(model, SRVGGNetCompact):
-        raise ValueError(
+        raise TypeError(
             f"{description} is not a compact generator. Only those are "
             "converted, because the heavy ones are not worth running on video."
         )
@@ -631,7 +633,7 @@ class NcnnUpscaler:
             try:
                 setattr(self.net.opt, name, value)
                 print(f"ncnn option {name} = {value}.")
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 print(f"Could not set ncnn option {name} ({e}).")
 
         self.net.load_param(str(param_path))
@@ -651,7 +653,7 @@ class NcnnUpscaler:
                 self.net.opt.workspace_vkallocator = blob
                 self.net.opt.staging_vkallocator = staging
                 self._allocators = [blob, staging]
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 print(
                     f"Could not hold on to the GPU allocators ({e}). ncnn will "
                     "take and return them every frame instead."
@@ -689,12 +691,12 @@ class NcnnUpscaler:
     def close(self):
         try:
             self.net.clear()
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
         for allocator in getattr(self, "_allocators", []):
             try:
                 allocator.clear()
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
         self._allocators = []
 
@@ -748,12 +750,12 @@ def load_ncnn_upscaler(weights, gpu=None, threads=0, fp16=True):
 def ncnn_devices():
     try:
         import ncnn
-    except Exception:
+    except Exception:  # noqa: BLE001
         return []
 
     try:
         count = ncnn.get_gpu_count()
-    except Exception:
+    except Exception:  # noqa: BLE001
         return []
 
     kinds = {0: "discrete", 1: "integrated", 2: "virtual", 3: "software"}
@@ -764,7 +766,7 @@ def ncnn_devices():
             info = ncnn.get_gpu_info(index)
             name = info.device_name()
             kind = kinds.get(info.type(), "")
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
         label = f"Vulkan via ncnn - {name}"
         if kind:
@@ -941,9 +943,7 @@ def probe_video(path):
     ]
 
     try:
-        completed = subprocess.run(
-            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False
-        )
+        completed = subprocess.run(command, capture_output=True, check=False)
     except FileNotFoundError:
         raise RuntimeError("ffprobe was not found. Install ffmpeg and try again.")
 
@@ -988,7 +988,7 @@ def probe_video(path):
         frames = 0
     frames_exact = frames > 0
     if frames <= 0 and duration > 0:
-        frames = int(round(duration * fps))
+        frames = round(duration * fps)
 
     has_audio = any(s.get("codec_type") == "audio" for s in streams)
 
@@ -1191,14 +1191,14 @@ def grow_pipe(stream, wanted=PIPE_TARGET_BYTES):
     setter = getattr(fcntl, "F_SETPIPE_SZ", 1031)
     try:
         descriptor = stream.fileno()
-    except Exception:
+    except Exception:  # noqa: BLE001
         return 0
 
     ceiling = wanted
     try:
         with open("/proc/sys/fs/pipe-max-size") as handle:
             ceiling = min(wanted, int(handle.read().strip()))
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
 
     size = max(ceiling, 65536)
@@ -1302,7 +1302,7 @@ def process_stream(
                     break
                 if not offer(reads, buffer):
                     return
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             failures.append(e)
         offer(reads, None)
 
@@ -1316,7 +1316,7 @@ def process_stream(
             try:
                 write_exact(sink, item)
                 delivered[0] += 1
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 failures.append(e)
 
     reader = threading.Thread(target=pump, name="animus-decode", daemon=True)
@@ -1411,9 +1411,9 @@ def terminate_process(process, timeout=FFMPEG_TERM_TIMEOUT):
         try:
             process.kill()
             process.wait(timeout=timeout)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
 
 
@@ -1439,7 +1439,7 @@ def available_devices():
         if torch.cuda.is_available():
             for index in range(torch.cuda.device_count()):
                 devices.append(f"cuda:{index}")
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
 
     try:
@@ -1447,13 +1447,13 @@ def available_devices():
         if xpu is not None and xpu.is_available():
             for index in range(xpu.device_count()):
                 devices.append(f"xpu:{index}")
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
 
     try:
         if torch.backends.mps.is_available():
             devices.append("mps")
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
 
     devices.extend(ident for ident, _label, _kind in ncnn_devices())
@@ -1475,7 +1475,7 @@ def describe_device(name):
         if name.startswith("xpu"):
             index = int(name.partition(":")[2] or 0)
             return f"{name} - {torch.xpu.get_device_name(index)}"
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     return name
 
@@ -1486,20 +1486,20 @@ def describe_torch_build():
         parts.append(
             "oneDNN " + ("on" if torch.backends.mkldnn.is_available() else "off")
         )
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     try:
         capability = torch.backends.cpu.get_cpu_capability()
         if BF16_IN_HARDWARE:
             capability += "+bf16"
         parts.append(capability)
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     try:
         parts.append(
             "OpenMP " + ("on" if torch.backends.openmp.is_available() else "off")
         )
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     parts.append(f"{torch.get_num_threads()} threads")
     return ", ".join(parts)
@@ -1641,7 +1641,7 @@ class UpscaleGUI(Gtk.Window):
                 provider,
                 Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"Could not set the interface font: {e}.")
 
     def _build_source_area(self):
@@ -2039,7 +2039,7 @@ class UpscaleGUI(Gtk.Window):
                     self.audio_combo.set_active_id(settings["audio"])
                 if settings.get("output_dir"):
                     self.output_entry.set_text(settings["output_dir"])
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"Error loading settings: {e}.")
         finally:
             self._loading_settings = False
@@ -2092,7 +2092,7 @@ class UpscaleGUI(Gtk.Window):
             CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
             with open(CONFIG_FILE, "w") as f:
                 json.dump(settings, f, indent=2)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"Error saving settings: {e}!")
 
     def on_source_entry_activate(self, entry):
@@ -2147,7 +2147,7 @@ class UpscaleGUI(Gtk.Window):
 
         try:
             info = probe_video(path)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             self.source = None
             self.source_label.set_text(str(e))
             self.start_button.set_sensitive(False)
@@ -2256,7 +2256,6 @@ class UpscaleGUI(Gtk.Window):
     def on_device_changed(self, widget=None):
         if self._loading_settings:
             return
-        gpu = (self.device_combo.get_active_id() or "cpu").startswith("ncnn:")
         for key, value in self._auto_knobs().items():
             if key in self._user_set or self._read_knob(key) == value:
                 continue
@@ -2377,7 +2376,7 @@ class UpscaleGUI(Gtk.Window):
             self.output_entry.get_text().strip() or str(OUTPUT_DIR)
         ).expanduser()
         stem = Path(info["path"]).stem
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
         dest = output_dir / (
             f"{stem}_{out_width}x{out_height}_{timestamp}."
             f"{container_for(encoder, container)}"
@@ -2502,12 +2501,12 @@ class UpscaleGUI(Gtk.Window):
                             continue
                     collected.append(text)
                     print(f"ffmpeg: {text.rstrip()}", file=sys.stderr)
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
             finally:
                 try:
                     stream.close()
-                except Exception:
+                except Exception:  # noqa: BLE001, S110
                     pass
 
         threading.Thread(target=reader, daemon=True).start()
@@ -2529,7 +2528,7 @@ class UpscaleGUI(Gtk.Window):
         if limit > 0:
             span = min(span, limit) if span > 0 else limit
         if span > 0:
-            return max(int(round(span * info["fps"])), 0)
+            return max(round(span * info["fps"]), 0)
         return info["frames"]
 
     def upscale_thread(self, job):
@@ -2589,7 +2588,7 @@ class UpscaleGUI(Gtk.Window):
                 )
                 try:
                     model = torch.compile(model)
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001
                     print(
                         f"torch.compile is not usable here ({e}). Carrying on "
                         "without it."
@@ -2806,7 +2805,7 @@ class UpscaleGUI(Gtk.Window):
         except KeyboardInterrupt:
             self.update_status("Stopped.")
             GLib.idle_add(self._set_progress, 0.0, "Stopped")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             if self.stop_event.is_set():
                 self.update_status("Stopped.")
             else:
@@ -2859,7 +2858,7 @@ class UpscaleGUI(Gtk.Window):
             step = max(1, -(-max(height, width) // PREVIEW_MAX_SIZE))
             small = rgb[::step, ::step].contiguous()
             return (small.numpy().tobytes(), int(small.shape[1]), int(small.shape[0]))
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"Preview failed: {e}.", file=sys.stderr)
             return None
 
@@ -2881,7 +2880,7 @@ class UpscaleGUI(Gtk.Window):
             )
             self.preview_image.set_from_pixbuf(pixbuf)
             self.preview_note.set_text(f"Newest frame, shown at {width}x{height}.")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"Could not display the preview: {e}.", file=sys.stderr)
         return False
 
@@ -2927,7 +2926,7 @@ def _has_encoder(name):
 def _self_test_ncnn(check):
     try:
         import ncnn  # noqa: F401
-    except Exception:
+    except Exception:  # noqa: BLE001
         return
 
     import tempfile
@@ -2955,11 +2954,11 @@ def _self_test_ncnn(check):
         for gpu, label in targets:
             for fp16 in ((False,) if gpu is None else (False, True)):
                 try:
-                    model, scale, multiple, overlap, _d = load_ncnn_upscaler(
+                    model, _scale, _multiple, _overlap, _d = load_ncnn_upscaler(
                         weights, gpu=gpu, threads=2, fp16=fp16
                     )
                     got = model(frame)
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001
                     check(f"ncnn {label} runs", False, f"{type(e).__name__}: {e}")
                     continue
 
@@ -3172,7 +3171,7 @@ def benchmark(target=None):
                 f"{width}x{height} from {Path(target).name}, "
                 f"{frames} frames at {info['fps']:.3f} fps"
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"Could not read {target}: {e}\nFalling back to 640x480.\n")
 
     installed = [
@@ -3273,7 +3272,7 @@ def benchmark(target=None):
                 seconds, _description = time_model(
                     best[2], default_threads, device, tile=tile
                 )
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 print(f"  {device:26s} unavailable: {e}")
                 continue
             timings[device] = seconds
@@ -3297,7 +3296,7 @@ def benchmark(target=None):
             seconds, _description = time_model(
                 best[2], default_threads, fastest, tile=tile
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"  {'tile ' + str(tile):26s} unavailable: {e}")
             continue
         projection = _format_duration(seconds * frames) if frames else "-"
@@ -3356,7 +3355,7 @@ def self_test():
 
         try:
             model, scale, multiple, overlap, description = build_upscaler(state_dict)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             check(f"{label}: detected", False, str(e))
             continue
 
@@ -3366,7 +3365,7 @@ def self_test():
 
         try:
             model.load_state_dict(state_dict, strict=True)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             check(f"{label}: strict load", False, str(e))
             continue
         check(f"{label}: strict load", True, f"overlap {overlap} px")
