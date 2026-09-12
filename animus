@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
 
-INVOKED_AS="$(basename "${BASH_SOURCE[0]}")"
-
 if command -v realpath >/dev/null 2>&1; then
     SCRIPT_PATH="$(realpath "${BASH_SOURCE[0]}")"
 elif command -v readlink >/dev/null 2>&1 && readlink -f / >/dev/null 2>&1; then
@@ -29,10 +27,7 @@ else
     exit 1
 fi
 
-case "$INVOKED_AS" in
-    animus-upscale) PYTHON_SCRIPT="$LIB_DIR/upscale.py" ;;
-    *)              PYTHON_SCRIPT="$LIB_DIR/animus.py" ;;
-esac
+PYTHON_SCRIPT="$LIB_DIR/animus.py"
 
 if [ ! -f "$PYTHON_SCRIPT" ]; then
     echo "Error: $(basename "$PYTHON_SCRIPT") not found at $PYTHON_SCRIPT"

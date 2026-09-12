@@ -48,6 +48,9 @@ prune-legacy-install:
 	@rm -f $(LEGACY_LIBDIR)/requirements.txt
 	@rm -f $(LEGACY_LIBDIR)/README.md $(LEGACY_LIBDIR)/COPYING
 	@rmdir $(LEGACY_LIBDIR) 2>/dev/null || true
+	@rm -f $(LIBDIR)/upscale.py
+	@rm -f $(BINDIR)/animus-upscale
+	@rm -f $(DESKTOPDIR)/animus-upscale.desktop
 
 install: torch-ensure prune-legacy-install
 	@mkdir -p $(LIBDIR)
@@ -55,7 +58,6 @@ install: torch-ensure prune-legacy-install
 	@mkdir -p $(DESKTOPDIR)
 
 	@install -m 755 animus.py $(LIBDIR)/animus.py
-	@install -m 755 upscale.py $(LIBDIR)/upscale.py
 	@install -m 644 requirements.txt $(LIBDIR)/requirements.txt
 	@install -m 644 README.md $(LIBDIR)/README.md
 	@install -m 644 COPYING $(LIBDIR)/COPYING
@@ -86,15 +88,11 @@ install: torch-ensure prune-legacy-install
 	fi
 
 	@install -m 755 animus $(BINDIR)/animus
-	@install -m 755 animus $(BINDIR)/animus-upscale
 
 	@sed 's|@BINDIR@|$(BINDIR)|g' animus.desktop.in > $(DESKTOPDIR)/animus.desktop
 	@chmod 644 $(DESKTOPDIR)/animus.desktop
-	@sed 's|@BINDIR@|$(BINDIR)|g' animus-upscale.desktop.in \
-		> $(DESKTOPDIR)/animus-upscale.desktop
-	@chmod 644 $(DESKTOPDIR)/animus-upscale.desktop
 
-	@echo "==> Installed to $(PREFIX). Run 'animus' or 'animus-upscale'."
+	@echo "==> Installed to $(PREFIX). Run 'animus'."
 
 torch:
 	@$(BUILD_ENV) ./build-torch.sh
@@ -103,7 +101,7 @@ ncnn:
 	@$(NCNN_ENV) ./build-ncnn.sh
 
 self-test:
-	@$(VENV_DIR)/bin/python $(LIBDIR)/upscale.py --self-test
+	@$(VENV_DIR)/bin/python $(LIBDIR)/animus.py --self-test
 
 torch-ensure:
 	@if [ "$(TORCH_PREBUILT)" = "1" ]; then \
@@ -114,9 +112,7 @@ torch-ensure:
 
 uninstall: prune-legacy-install
 	@rm -f $(BINDIR)/animus
-	@rm -f $(BINDIR)/animus-upscale
 	@rm -f $(DESKTOPDIR)/animus.desktop
-	@rm -f $(DESKTOPDIR)/animus-upscale.desktop
 	@rm -fr $(LIBDIR)
 
 clean:
