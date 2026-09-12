@@ -93,17 +93,36 @@ QUEUE_BYTES = 256 * 1024 * 1024
 PIPE_TARGET_BYTES = 1024 * 1024
 
 REAL_ESRGAN_RELEASES = "https://github.com/xinntao/Real-ESRGAN/releases/download"
+LIVE_ACTION_SPAN = (
+    "https://raw.githubusercontent.com/jcj83429/upscaling/"
+    "5d8cdd2e17750b64be39ccab3a8763d91128fe15/2xLiveActionV1_SPAN"
+)
+
+MODEL_LICENSES = {
+    "2xLiveActionV1_SPAN.pth": "Apache-2.0",
+    "realesr-general-x4v3.pth": "BSD-3-Clause",
+    "realesr-animevideov3.pth": "BSD-3-Clause",
+    "RealESRGAN_x4plus_anime_6B.pth": "BSD-3-Clause",
+    "RealESRGAN_x4plus.pth": "BSD-3-Clause",
+}
+
+PERMISSIVE_LICENSES = frozenset(("Apache-2.0", "BSD-3-Clause", "MIT", "CC0-1.0"))
 
 BUILTIN_MODELS = (
     (
-        "Anime video (fast)",
-        "realesr-animevideov3.pth",
-        f"{REAL_ESRGAN_RELEASES}/v0.2.5.0/realesr-animevideov3.pth",
+        "Live action video (SPAN)",
+        "2xLiveActionV1_SPAN.pth",
+        f"{LIVE_ACTION_SPAN}/2xLiveActionV1_SPAN_490000.pth",
     ),
     (
         "General video (slower)",
         "realesr-general-x4v3.pth",
         f"{REAL_ESRGAN_RELEASES}/v0.2.5.0/realesr-general-x4v3.pth",
+    ),
+    (
+        "Anime video (fast)",
+        "realesr-animevideov3.pth",
+        f"{REAL_ESRGAN_RELEASES}/v0.2.5.0/realesr-animevideov3.pth",
     ),
     (
         "Anime (heavy, RRDB)",
@@ -117,7 +136,7 @@ BUILTIN_MODELS = (
     ),
 )
 
-DEFAULT_MODEL = BUILTIN_MODELS[0][1]
+DEFAULT_MODEL = "2xLiveActionV1_SPAN.pth"
 CUSTOM_MODEL_ID = "custom"
 
 OUTPUT_PRESETS = (
@@ -366,6 +385,131 @@ class RRDBNet(nn.Module):
         return self.conv_last(self.lrelu(self.conv_hr(feat)))
 
 
+class Conv3XC(nn.Module):
+    def __init__(self, c_in, c_out, gain=2):
+        super().__init__()
+        self.sk = nn.Conv2d(c_in, c_out, 1, padding=0, bias=True)
+        self.conv = nn.Sequential(
+            nn.Conv2d(c_in, c_in * gain, 1, padding=0, bias=True),
+            nn.Conv2d(c_in * gain, c_out * gain, 3, padding=0, bias=True),
+            nn.Conv2d(c_out * gain, c_out, 1, padding=0, bias=True),
+        )
+        self.eval_conv = nn.Conv2d(c_in, c_out, 3, padding=1, bias=True)
+
+    @torch.no_grad()
+    def fuse(self):
+        w1, b1 = self.conv[0].weight, self.conv[0].bias
+        w2, b2 = self.conv[1].weight, self.conv[1].bias
+        w3, b3 = self.conv[2].weight, self.conv[2].bias
+
+        weight = (
+            F.conv2d(w1.flip(2, 3).permute(1, 0, 2, 3), w2, padding=2)
+            .flip(2, 3)
+            .permute(1, 0, 2, 3)
+        )
+        bias = (w2 * b1.reshape(1, -1, 1, 1)).sum((1, 2, 3)) + b2
+        weight = (
+            F.conv2d(weight.flip(2, 3).permute(1, 0, 2, 3), w3)
+            .flip(2, 3)
+            .permute(1, 0, 2, 3)
+        )
+        bias = (w3 * bias.reshape(1, -1, 1, 1)).sum((1, 2, 3)) + b3
+
+        self.eval_conv.weight.copy_(weight + F.pad(self.sk.weight, [1, 1, 1, 1]))
+        self.eval_conv.bias.copy_(bias + self.sk.bias)
+
+        del self.sk, self.conv
+        return self
+
+    def forward(self, x):
+        return self.eval_conv(x)
+
+
+class SPAB(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.c1_r = Conv3XC(channels, channels)
+        self.c2_r = Conv3XC(channels, channels)
+        self.c3_r = Conv3XC(channels, channels)
+        self.act1 = nn.SiLU(inplace=True)
+
+    def forward(self, x):
+        out1 = self.act1(self.c1_r(x))
+        out2 = self.act1(self.c2_r(out1))
+        out3 = self.c3_r(out2)
+        attention = torch.sigmoid(out3) - 0.5
+        return (out3 + x) * attention, out1
+
+
+class SPAN(nn.Module):
+    def __init__(
+        self,
+        num_in_ch=3,
+        num_out_ch=3,
+        feature_channels=48,
+        num_block=6,
+        upscale=4,
+        norm=False,
+        img_range=255.0,
+        rgb_mean=(0.4488, 0.4371, 0.4040),
+    ):
+        super().__init__()
+        self.num_out_ch = num_out_ch
+        self.upscale = upscale
+        self.num_block = num_block
+        self.img_range = img_range
+        self.register_buffer(
+            "mean", torch.tensor(rgb_mean).view(1, 3, 1, 1), persistent=False
+        )
+        if not norm:
+            self.register_buffer("no_norm", torch.zeros(1))
+
+        self.conv_1 = Conv3XC(num_in_ch, feature_channels)
+        for index in range(num_block):
+            setattr(self, f"block_{index + 1}", SPAB(feature_channels))
+        self.conv_cat = nn.Conv2d(feature_channels * 4, feature_channels, 1, bias=True)
+        self.conv_2 = Conv3XC(feature_channels, feature_channels)
+        self.upsampler = nn.Sequential(
+            nn.Conv2d(
+                feature_channels,
+                num_out_ch * upscale * upscale,
+                3,
+                padding=1,
+                bias=True,
+            ),
+            nn.PixelShuffle(upscale),
+        )
+
+    @property
+    def blocks(self):
+        return [getattr(self, f"block_{i + 1}") for i in range(self.num_block)]
+
+    @property
+    def is_norm(self):
+        return not hasattr(self, "no_norm")
+
+    def fuse(self):
+        for module in self.modules():
+            if isinstance(module, Conv3XC):
+                module.fuse()
+        return self
+
+    def forward(self, x):
+        if self.is_norm:
+            x = (x - self.mean.to(x.dtype)) * self.img_range
+
+        feature = self.conv_1(x)
+        flowing, first, inner = feature, None, None
+        for index, block in enumerate(self.blocks):
+            flowing, inner = block(flowing)
+            if index == 0:
+                first = flowing
+
+        tail = self.conv_2(flowing)
+        joined = self.conv_cat(torch.cat((feature, tail, first, inner), 1))
+        return self.upsampler(joined)
+
+
 def read_state_dict(path):
     path = Path(path)
 
@@ -396,7 +540,44 @@ def _body_indices(state_dict):
     return indices
 
 
+def build_span(state_dict):
+    weight = state_dict["conv_1.sk.weight"]
+    feature_channels = int(weight.shape[0])
+    num_in_ch = int(weight.shape[1])
+
+    blocks = set()
+    for key in state_dict:
+        match = re.match(r"block_(\d+)\.", key)
+        if match:
+            blocks.add(int(match.group(1)))
+    if not blocks or sorted(blocks) != list(range(1, len(blocks) + 1)):
+        raise ValueError("The SPAN checkpoint has no usable block numbering.")
+    num_block = len(blocks)
+
+    out_planes = int(state_dict["upsampler.0.weight"].shape[0])
+    upscale = round(math.sqrt(out_planes / max(num_in_ch, 1)))
+    if upscale < 1 or num_in_ch * upscale * upscale != out_planes:
+        raise ValueError(
+            f"Cannot derive the scale from a {out_planes}-channel upsampler."
+        )
+
+    model = SPAN(
+        num_in_ch=num_in_ch,
+        num_out_ch=num_in_ch,
+        feature_channels=feature_channels,
+        num_block=num_block,
+        upscale=upscale,
+        norm="no_norm" not in state_dict,
+    )
+    min_overlap = 3 * num_block + 3
+    description = f"SPAN x{upscale} ({num_block} blocks, {feature_channels} features)"
+    return model, upscale, 1, min_overlap, description
+
+
 def build_upscaler(state_dict):
+    if "conv_1.sk.weight" in state_dict:
+        return build_span(state_dict)
+
     if "conv_first.weight" in state_dict:
         weight = state_dict["conv_first.weight"]
         num_feat = int(weight.shape[0])
@@ -437,10 +618,10 @@ def build_upscaler(state_dict):
     conv_indices = sorted(i for i, dim in indices.items() if dim == 4)
     if not conv_indices or conv_indices[0] != 0:
         raise ValueError(
-            "Unrecognized checkpoint. This reads the two Real-ESRGAN "
-            "architectures - SRVGGNetCompact (realesr-*v3) and RRDBNet "
-            "(RealESRGAN_x*plus, plain ESRGAN) and nothing else. Newer "
-            "designs such as SPAN, OmniSR or DAT would each need their own "
+            "Unrecognized checkpoint. This reads SPAN and the two "
+            "Real-ESRGAN architectures - SRVGGNetCompact (realesr-*v3) and "
+            "RRDBNet (RealESRGAN_x*plus, plain ESRGAN) and nothing else. "
+            "Other designs such as OmniSR or DAT would each need their own "
             "reader."
         )
 
@@ -481,6 +662,8 @@ def load_upscaler(path, device, channels_last=True, dtype=torch.float32):
     state_dict = read_state_dict(path)
     model, scale, size_multiple, min_overlap, description = build_upscaler(state_dict)
     model.load_state_dict(state_dict, strict=True)
+    if hasattr(model, "fuse"):
+        model.fuse()
     model.eval()
 
     for param in model.parameters():
@@ -527,15 +710,129 @@ def ncnn_option_overrides():
     return overrides
 
 
-def write_ncnn_model(state_dict, param_path, bin_path):
-    model, scale, size_multiple, min_overlap, description = build_upscaler(state_dict)
-    if not isinstance(model, SRVGGNetCompact):
-        raise TypeError(
-            f"{description} is not a compact generator. Only those are "
-            "converted, because the heavy ones are not worth running on video."
-        )
-    model.load_state_dict(state_dict, strict=True)
+BINARY_ADD, BINARY_SUB, BINARY_MUL = 0, 1, 2
 
+
+class NcnnGraph:
+    def __init__(self):
+        self.layers = []
+
+    def add(self, kind, name, inputs, outputs, params=(), weights=()):
+        self.layers.append(
+            {
+                "kind": kind,
+                "name": name,
+                "inputs": list(inputs),
+                "outputs": list(outputs),
+                "params": list(params),
+                "weights": list(weights),
+            }
+        )
+        return outputs[0] if len(outputs) == 1 else tuple(outputs)
+
+    def input(self, name="data"):
+        return self.add("Input", name, [], [name])
+
+    def conv(self, name, source, target, conv, weight, bias):
+        return self.add(
+            "Convolution",
+            name,
+            [source],
+            [target],
+            [
+                f"0={conv.out_channels}",
+                f"1={conv.kernel_size[1]}",
+                f"11={conv.kernel_size[0]}",
+                f"3={conv.stride[1]}",
+                f"13={conv.stride[0]}",
+                f"4={conv.padding[1]}",
+                f"14={conv.padding[0]}",
+                "5=1",
+                f"6={weight.numel()}",
+            ],
+            [(True, weight), (False, bias)],
+        )
+
+    def unary(self, kind, name, source, target, params=(), weights=()):
+        return self.add(kind, name, [source], [target], params, weights)
+
+    def binary(self, name, op, left, right, target):
+        return self.add("BinaryOp", name, [left, right], [target], [f"0={op}"])
+
+    def scalar(self, name, op, source, target, value):
+        return self.add(
+            "BinaryOp", name, [source], [target], [f"0={op}", "1=1", f"2={value}"]
+        )
+
+    def _fork(self):
+        demand = {}
+        for layer in self.layers:
+            for blob in layer["inputs"]:
+                demand[blob] = demand.get(blob, 0) + 1
+
+        supply, resolved = {}, []
+        for layer in self.layers:
+            layer["inputs"] = [
+                supply[blob].pop(0) if blob in supply else blob
+                for blob in layer["inputs"]
+            ]
+            resolved.append(layer)
+            for blob in layer["outputs"]:
+                count = demand.get(blob, 0)
+                if count < 2:
+                    continue
+                copies = [f"{blob}_s{index}" for index in range(count)]
+                supply[blob] = list(copies)
+                resolved.append(
+                    {
+                        "kind": "Split",
+                        "name": f"fork_{blob}",
+                        "inputs": [blob],
+                        "outputs": copies,
+                        "params": [],
+                        "weights": [],
+                    }
+                )
+        self.layers = resolved
+
+    def write(self, param_path, bin_path):
+        self._fork()
+
+        blobs = []
+        for layer in self.layers:
+            for blob in layer["outputs"]:
+                if blob not in blobs:
+                    blobs.append(blob)
+
+        lines = []
+        for layer in self.layers:
+            fields = [
+                f"{layer['kind']:<16}",
+                f"{layer['name']:<9}",
+                str(len(layer["inputs"])),
+                str(len(layer["outputs"])),
+                *layer["inputs"],
+                *layer["outputs"],
+                *layer["params"],
+            ]
+            lines.append(" ".join(fields).rstrip())
+
+        Path(param_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(param_path, "w") as handle:
+            handle.write(f"{NCNN_MAGIC}\n{len(lines)} {len(blobs)}\n")
+            handle.write("\n".join(lines) + "\n")
+
+        with open(bin_path, "wb") as handle:
+            for layer in self.layers:
+                for flagged, tensor in layer["weights"]:
+                    if flagged:
+                        handle.write(struct.pack("<I", 0))
+                    handle.write(
+                        tensor.detach().to(torch.float32).contiguous().numpy().tobytes()
+                    )
+
+
+def _write_compact_ncnn(graph, model, state_dict, scale):
     convolutions, activations = [], []
     for index, layer in enumerate(model.body):
         if isinstance(layer, nn.Conv2d):
@@ -543,67 +840,131 @@ def write_ncnn_model(state_dict, param_path, bin_path):
         else:
             activations.append((index, layer))
 
-    lines = [
-        "Input            data      0 1 data",
-        "Split            fork      1 2 data body skip",
-    ]
-    blobs = ["data", "body", "skip"]
-    weights = []
-    previous = "body"
+    source = graph.input()
+    previous = source
 
     for order, (index, conv) in enumerate(convolutions):
-        blob = f"c{order}"
-        blobs.append(blob)
-        weight = state_dict[f"body.{index}.weight"]
-        lines.append(
-            f"Convolution      conv{order} 1 1 {previous} {blob} "
-            f"0={conv.out_channels} 1={conv.kernel_size[1]} "
-            f"11={conv.kernel_size[0]} 3={conv.stride[1]} 13={conv.stride[0]} "
-            f"4={conv.padding[1]} 14={conv.padding[0]} 5=1 6={weight.numel()}"
+        previous = graph.conv(
+            f"conv{order}",
+            previous,
+            f"c{order}",
+            conv,
+            state_dict[f"body.{index}.weight"],
+            state_dict[f"body.{index}.bias"],
         )
-        weights.append((True, weight))
-        weights.append((False, state_dict[f"body.{index}.bias"]))
-        previous = blob
 
         if order >= len(activations):
             continue
         act_index, activation = activations[order]
-        blob = f"a{order}"
-        blobs.append(blob)
         if isinstance(activation, nn.PReLU):
             slope = state_dict[f"body.{act_index}.weight"]
-            lines.append(
-                f"PReLU            act{order} 1 1 {previous} {blob} "
-                f"0={slope.numel()}"
+            previous = graph.unary(
+                "PReLU",
+                f"act{order}",
+                previous,
+                f"a{order}",
+                [f"0={slope.numel()}"],
+                [(False, slope)],
             )
-            weights.append((False, slope))
         else:
             negative = float(getattr(activation, "negative_slope", 0.0))
-            lines.append(
-                f"ReLU             act{order} 1 1 {previous} {blob} " f"0={negative}"
+            previous = graph.unary(
+                "ReLU", f"act{order}", previous, f"a{order}", [f"0={negative}"]
             )
-        previous = blob
 
-    blobs += ["shuffled", "nearest", "out"]
-    lines.append(f"PixelShuffle     shuffle   1 1 {previous} shuffled 0={scale} 1=0")
-    lines.append(
-        f"Interp           nearest   1 1 skip nearest 0=1 "
-        f"1={float(scale)} 2={float(scale)}"
+    shuffled = graph.unary(
+        "PixelShuffle", "shuffle", previous, "shuffled", [f"0={scale}", "1=0"]
     )
-    lines.append("BinaryOp         add       2 1 shuffled nearest out 0=0")
+    nearest = graph.unary(
+        "Interp",
+        "nearest",
+        source,
+        "nearest",
+        ["0=1", f"1={float(scale)}", f"2={float(scale)}"],
+    )
+    graph.binary("add", BINARY_ADD, shuffled, nearest, "out")
 
-    Path(param_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(param_path, "w") as handle:
-        handle.write(f"{NCNN_MAGIC}\n{len(lines)} {len(blobs)}\n")
-        handle.write("\n".join(lines) + "\n")
 
-    with open(bin_path, "wb") as handle:
-        for flagged, tensor in weights:
-            if flagged:
-                handle.write(struct.pack("<I", 0))
-            handle.write(
-                tensor.detach().to(torch.float32).contiguous().numpy().tobytes()
-            )
+def _write_span_ncnn(graph, model, scale):
+    source = graph.input()
+
+    if model.is_norm:
+        mean = model.mean.reshape(-1)
+        channels = int(mean.numel())
+        rate = float(model.img_range)
+        weight = torch.zeros(channels, channels, 1, 1)
+        for index in range(channels):
+            weight[index, index, 0, 0] = rate
+        source = graph.add(
+            "Convolution",
+            "norm",
+            [source],
+            ["normed"],
+            [
+                f"0={channels}",
+                "1=1",
+                "11=1",
+                "3=1",
+                "13=1",
+                "4=0",
+                "14=0",
+                "5=1",
+                f"6={weight.numel()}",
+            ],
+            [(True, weight), (False, -mean * rate)],
+        )
+
+    def emit(name, module, source, target):
+        return graph.conv(name, source, target, module, module.weight, module.bias)
+
+    feature = emit("conv_1", model.conv_1.eval_conv, source, "feature")
+
+    flowing, first, inner = feature, None, None
+    for index, block in enumerate(model.blocks):
+        tag = f"b{index}"
+        gated = emit(f"{tag}c1", block.c1_r.eval_conv, flowing, f"{tag}_c1")
+        inner = graph.unary("Swish", f"{tag}a1", gated, f"{tag}_i")
+        mid = emit(f"{tag}c2", block.c2_r.eval_conv, inner, f"{tag}_c2")
+        act2 = graph.unary("Swish", f"{tag}a2", mid, f"{tag}_a2")
+        out3 = emit(f"{tag}c3", block.c3_r.eval_conv, act2, f"{tag}_c3")
+
+        sigmoid = graph.unary("Sigmoid", f"{tag}sig", out3, f"{tag}_g")
+        attention = graph.scalar(f"{tag}att", BINARY_SUB, sigmoid, f"{tag}_t", 0.5)
+        summed = graph.binary(f"{tag}add", BINARY_ADD, out3, flowing, f"{tag}_s")
+        flowing = graph.binary(f"{tag}mul", BINARY_MUL, summed, attention, f"{tag}_r")
+        if index == 0:
+            first = flowing
+
+    tail = emit("conv_2", model.conv_2.eval_conv, flowing, "tail")
+    graph.add("Concat", "cat", [feature, tail, first, inner], ["cat"], ["0=0"])
+    graph.conv(
+        "conv_cat",
+        "cat",
+        "joined",
+        model.conv_cat,
+        model.conv_cat.weight,
+        model.conv_cat.bias,
+    )
+    emit("up", model.upsampler[0], "joined", "shuffled")
+    graph.unary("PixelShuffle", "shuffle", "shuffled", "out", [f"0={scale}", "1=0"])
+
+
+def write_ncnn_model(state_dict, param_path, bin_path):
+    model, scale, size_multiple, min_overlap, description = build_upscaler(state_dict)
+    if not isinstance(model, (SRVGGNetCompact, SPAN)):
+        raise TypeError(
+            f"{description} is not a compact generator. Only those are "
+            "converted, because the heavy ones are not worth running on video."
+        )
+    model.load_state_dict(state_dict, strict=True)
+
+    graph = NcnnGraph()
+    if isinstance(model, SPAN):
+        model.fuse()
+        _write_span_ncnn(graph, model, scale)
+    else:
+        _write_compact_ncnn(graph, model, state_dict, scale)
+    graph.write(param_path, bin_path)
 
     return scale, size_multiple, min_overlap, description
 
@@ -731,9 +1092,8 @@ def load_ncnn_upscaler(weights, gpu=None, threads=0, fp16=True):
     if gpu is not None and not model.on_gpu:
         print(
             f"ncnn could not use Vulkan device {gpu} and fell back to its own "
-            "CPU backend, which is why this will be slow. The device list is "
-            "built from what Vulkan enumerates, which is not the same as what "
-            "ncnn can open."
+            "CPU backend. The device list is built from what Vulkan enumerates, "
+            "which is not the same as what ncnn can open."
         )
 
     where = f"Vulkan device {gpu}" if model.on_gpu else "CPU"
@@ -1745,7 +2105,7 @@ class UpscaleGUI(Gtk.Window):
 
         self.model_entry = Gtk.Entry()
         self.model_entry.set_placeholder_text(
-            "A .pth or .safetensors Real-ESRGAN / ESRGAN checkpoint"
+            "A .pth or .safetensors SPAN / Real-ESRGAN / ESRGAN checkpoint"
         )
         custom_box.pack_start(self.model_entry, True, True, 0)
 
@@ -2551,6 +2911,9 @@ class UpscaleGUI(Gtk.Window):
                     stop_check=self.stop_event.is_set,
                 )
                 self.update_status(f"Saved {model_path}.")
+                terms = MODEL_LICENSES.get(model_path.name)
+                if terms:
+                    self.update_status(f"{model_path.name} is under {terms}.")
 
             self.update_status(f"Loading {model_path.name}...")
             on_ncnn = job["device"].startswith("ncnn:")
@@ -2923,6 +3286,16 @@ def _has_encoder(name):
     return f" {name} " in listed.stdout.decode("utf-8", "replace")
 
 
+def _ncnn_probe_models():
+    torch.manual_seed(0)
+    yield "compact", SRVGGNetCompact(num_feat=16, num_conv=3, upscale=2)
+    for norm in (False, True):
+        model = SPAN(feature_channels=16, num_block=2, upscale=2, norm=norm)
+        for parameter in model.parameters():
+            nn.init.normal_(parameter, std=0.05)
+        yield f"span norm={str(norm).lower()}", model
+
+
 def _self_test_ncnn(check):
     try:
         import ncnn  # noqa: F401
@@ -2931,19 +3304,24 @@ def _self_test_ncnn(check):
 
     import tempfile
 
-    torch.manual_seed(0)
-    reference = SRVGGNetCompact(num_feat=16, num_conv=3, upscale=2)
+    for architecture, reference in _ncnn_probe_models():
+        _self_test_ncnn_model(check, architecture, reference, tempfile)
+
+
+def _self_test_ncnn_model(check, architecture, reference, tempfile):
     reference.eval()
     for parameter in reference.parameters():
         parameter.requires_grad_(False)
 
     frame = torch.rand(1, 3, 24, 32)
-    with torch.inference_mode():
-        want = reference(frame)
 
     with tempfile.TemporaryDirectory(prefix="animus-ncnn-") as workdir:
         weights = Path(workdir) / "probe.pth"
         torch.save({"params": reference.state_dict()}, weights)
+        if hasattr(reference, "fuse"):
+            reference.fuse()
+        with torch.inference_mode():
+            want = reference(frame)
 
         targets = [(None, "CPU")]
         targets += [
@@ -2952,6 +3330,7 @@ def _self_test_ncnn(check):
         ]
 
         for gpu, label in targets:
+            label = f"{architecture} {label}"
             for fp16 in ((False,) if gpu is None else (False, True)):
                 try:
                     model, _scale, _multiple, _overlap, _d = load_ncnn_upscaler(
@@ -2983,7 +3362,8 @@ def _self_test_ncnn(check):
                     continue
 
                 delta = (got - want).abs().max().item()
-                limit = 6e-2 if fp16 else 1e-4
+                spread = max(1.0, want.abs().max().item())
+                limit = (6e-2 if fp16 else 1e-4) * spread
                 check(
                     f"{name} matches torch",
                     delta < limit,
@@ -3332,6 +3712,18 @@ def self_test():
         ("RRDB x4", RRDBNet(scale=4, num_feat=8, num_block=2, num_grow_ch=4), 4, 1),
         ("RRDB x2", RRDBNet(scale=2, num_feat=8, num_block=2, num_grow_ch=4), 2, 2),
         ("RRDB x1", RRDBNet(scale=1, num_feat=8, num_block=1, num_grow_ch=4), 1, 4),
+        (
+            "SPAN x2",
+            SPAN(feature_channels=16, num_block=2, upscale=2, norm=False),
+            2,
+            1,
+        ),
+        (
+            "SPAN x4 normalized",
+            SPAN(feature_channels=16, num_block=3, upscale=4, norm=True),
+            4,
+            1,
+        ),
     )
 
     failures = []
@@ -3371,6 +3763,9 @@ def self_test():
         check(f"{label}: strict load", True, f"overlap {overlap} px")
 
         model.eval()
+        if hasattr(model, "fuse"):
+            model.fuse()
+            reference.fuse()
         with torch.inference_mode():
             want = upscale_frame(reference, frame, scale, 0, 0, multiple)
             whole = upscale_frame(model, frame, scale, 0, 0, multiple)
@@ -3387,9 +3782,10 @@ def self_test():
         check(f"{label}: matches the reference module", torch.equal(whole, want))
 
         delta = (whole - tiled).abs().max().item()
+        spread = max(1.0, whole.abs().max().item())
         check(
             f"{label}: tiling with full overlap matches whole frames",
-            delta < 1e-4,
+            delta < 1e-4 * spread,
             f"max |diff| = {delta:.2e}",
         )
 
@@ -3440,6 +3836,28 @@ def self_test():
     for label, arguments, want in chains:
         got = output_filters(*arguments)
         check(f"output filters: {label}", got == want, got or "(none)")
+
+    builtin = {filename for _label, filename, _url in BUILTIN_MODELS}
+    check(
+        "the default model is one of the built-in ones",
+        DEFAULT_MODEL in builtin,
+        DEFAULT_MODEL,
+    )
+    check(
+        "the default model is under a license that restricts nobody",
+        MODEL_LICENSES.get(DEFAULT_MODEL) in PERMISSIVE_LICENSES,
+        MODEL_LICENSES.get(DEFAULT_MODEL, "unrecorded"),
+    )
+    check(
+        "every model offered has its license recorded",
+        builtin <= set(MODEL_LICENSES),
+        ", ".join(sorted(builtin - set(MODEL_LICENSES))) or "all recorded",
+    )
+    check(
+        "no license is recorded for a model that is not offered",
+        set(MODEL_LICENSES) <= builtin,
+        ", ".join(sorted(set(MODEL_LICENSES) - builtin)) or "none stale",
+    )
 
     _self_test_ncnn(check)
 
