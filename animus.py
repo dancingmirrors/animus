@@ -537,24 +537,7 @@ FLUX_LATENT_RGB_BIAS = [-0.0329, -0.0718, -0.0851]
 GGUF_NOT_A_DIT = ("text_encoder", "gemma", "qwen", "clip", "t5", "llava", "vae")
 
 
-ZANIME_COMPONENTS_REPO = "SeeSee21/Z-Anime"
-ZANIME_COMPONENTS_PREFIX = "diffusers"
-ZIMAGE_UPSTREAM_REPO = "Tongyi-MAI/Z-Image-Turbo"
-ZANIME_GGUF_REPO = "SeeSee21/Z-Anime"
-ZANIME_DEFAULT_DIT = ZANIME_GGUF_REPO
-ZANIME_DEFAULT_STEPS = 30
-ZANIME_DEFAULT_GUIDANCE = 3.0
-ZANIME_DEFAULT_SIZE = 512
-ZANIME_DEFAULT_SAMPLER = "Euler Ancestral"
-ZANIME_DEFAULT_SIGMAS = "Beta"
-ZANIME_SAMPLERS = FLOW_SAMPLERS
-ZANIME_DEFAULT_SHIFT = 6.0
-ZANIME_DEFAULT_CFG_TRUNC = 1.0
-ZANIME_MAX_SEQUENCE_LENGTH = 512
-ZANIME_TOKEN_LIMIT = ZANIME_MAX_SEQUENCE_LENGTH
-ZANIME_SIZE_MULTIPLE = 16
 QWEN_TEMPLATE_MIN_TOKENS = 5
-ZANIME_TEXT_ENCODER_DTYPE = torch.bfloat16
 
 ZIMAGE_COMPONENTS_REPO = "Tongyi-MAI/Z-Image-Turbo"
 ZIMAGE_GGUF_REPO = "leejet/Z-Image-Turbo-GGUF"
@@ -6168,38 +6151,6 @@ class ZImagePane(NativeZImagePane):
     max_sequence_length = ZIMAGE_MAX_SEQUENCE_LENGTH
 
 
-class ZAnimePane(NativeZImagePane):
-    name = "zanime"
-    mode_label = "Z-Anime"
-    output_label = "Generated Image (Z-Anime)"
-
-    model_name = "Z-Anime"
-    browse_title = "Select a Z-Anime GGUF (diffusion transformer)"
-    count_tokenizer = ZANIME_COMPONENTS_REPO
-    count_tokenizer_subfolder = f"{ZANIME_COMPONENTS_PREFIX}/tokenizer"
-
-    components_repo = ZANIME_COMPONENTS_REPO
-    components_prefix = ZANIME_COMPONENTS_PREFIX
-    component_repos = {"tokenizer": (ZIMAGE_UPSTREAM_REPO, "")}
-    text_encoder_dtype = ZANIME_TEXT_ENCODER_DTYPE
-
-    default_dit = ZANIME_DEFAULT_DIT
-    default_steps = ZANIME_DEFAULT_STEPS
-    default_guidance = ZANIME_DEFAULT_GUIDANCE
-    default_size = ZANIME_DEFAULT_SIZE
-    default_sampler = ZANIME_DEFAULT_SAMPLER
-    default_shift = ZANIME_DEFAULT_SHIFT
-    default_cfg_trunc = ZANIME_DEFAULT_CFG_TRUNC
-    default_sigmas = ZANIME_DEFAULT_SIGMAS
-    token_limit = ZANIME_TOKEN_LIMIT
-    max_sequence_length = ZANIME_MAX_SEQUENCE_LENGTH
-    samplers = ZANIME_SAMPLERS
-    size_multiple = ZANIME_SIZE_MULTIPLE
-    gguf_prefer = ("base",)
-    gguf_avoid = ("distill", "turbo", "lightning")
-    expects_distilled = False
-
-
 class UpscalePane:
     name = "upscale"
     mode_label = "Upscale"
@@ -8385,17 +8336,11 @@ class AnimusWindow(Gtk.Window):
         for pane in (
             GeneratePane(self),
             ZImagePane(self),
-            ZAnimePane(self),
             UpscalePane(self),
         ):
             self._add_pane(pane)
 
-        (
-            self.generate,
-            self.zimage,
-            self.zanime,
-            self.upscale,
-        ) = self.panes
+        self.generate, self.zimage, self.upscale = self.panes
 
         self.output_notebook.set_current_page(self.console_page)
         self.mode_notebook.connect("switch-page", self.on_mode_switched)
