@@ -2710,7 +2710,7 @@ class VulkanZImage:
         self.progress(
             f"Activations for {n} tokens: {format_bytes(total)}, of which "
             f"{format_bytes(scores.size)} of attention scores for "
-            f"{scores.size // per_head} heads per pass. {format_bytes(free_after)} "
+            f"{scores.size // per_head} heads per pass, with {format_bytes(free_after)} "
             "of device memory still free."
         )
         return self.activations
