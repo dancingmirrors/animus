@@ -21,8 +21,10 @@ if not os.environ.get("PYTHONIOENCODING"):
 
 import ctypes
 import errno
+import contextlib
 import gc
 import json
+import logging as stdlib_logging
 import math
 import queue
 import random
@@ -95,6 +97,14 @@ except Exception:  # pragma: Requires diffusers >= 0.39.0.  # noqa: BLE001
     FlowMatchEulerDiscreteScheduler = None
     UniPCMultistepScheduler = None
     ANIMA_AVAILABLE = False
+
+try:
+    from diffusers import AutoencoderKL
+
+    VAE_AVAILABLE = ANIMA_AVAILABLE
+except Exception:  # pragma: Requires diffusers.  # noqa: BLE001
+    AutoencoderKL = None
+    VAE_AVAILABLE = False
 
 try:
     from diffusers import ClassifierFreeGuidance
@@ -455,7 +465,10 @@ ANIMA_DEFAULT_SEED = -1
 ANIMA_SEED_MAX = 2**32 - 1
 
 ANIMA_TOKEN_LIMIT = 512
-ANIMA_TOKEN_WARNING = 448
+
+TOKEN_WARNING_FRACTION = 0.875
+
+UNQUANTIZED_PREFIX = "unquantized:"
 
 PREVIEW_DISPLAY_SIZE = 512
 ANIMA_LATENT_RGB_FACTORS = [
@@ -478,9 +491,234 @@ ANIMA_LATENT_RGB_FACTORS = [
 ]
 ANIMA_LATENT_RGB_BIAS = [-0.1835, -0.0868, -0.3360]
 
+GGUF_QUANT_PREFERENCE = (
+    "q4_k_m",
+    "q4_k_s",
+    "q4_k",
+    "q4_0",
+    "q5_k_m",
+    "q5_k_s",
+    "q5_k",
+    "q5_0",
+    "q6_k",
+    "q8_0",
+)
+DEFAULT_DECODE_EVERY = 5
 
-def build_anima_scheduler(sampler, base_scheduler, shift=None):
+FLOW_SAMPLERS = ("Euler", "Euler Ancestral", "UniPC")
+SIGMA_SCHEDULES = ("Default", "Beta", "Karras", "Exponential")
+DEFAULT_SIGMAS = "Default"
+SIGMA_CONFIG_KEYS = {
+    "Beta": "use_beta_sigmas",
+    "Karras": "use_karras_sigmas",
+    "Exponential": "use_exponential_sigmas",
+}
+FLUX_LATENT_RGB_FACTORS = [
+    [-0.0346, 0.0244, 0.0681],
+    [0.0034, 0.0210, 0.0687],
+    [0.0275, -0.0668, -0.0433],
+    [-0.0174, 0.0160, 0.0617],
+    [0.0859, 0.0721, 0.0329],
+    [0.0004, 0.0383, 0.0115],
+    [0.0405, 0.0861, 0.0915],
+    [-0.0236, -0.0185, -0.0259],
+    [-0.0245, 0.0250, 0.1180],
+    [0.1008, 0.0755, -0.0421],
+    [-0.0515, 0.0201, 0.0011],
+    [0.0428, -0.0012, -0.0036],
+    [0.0817, 0.0765, 0.0749],
+    [-0.1264, -0.0522, -0.1103],
+    [-0.0280, -0.0881, -0.0499],
+    [-0.1262, -0.0982, -0.0778],
+]
+FLUX_LATENT_RGB_BIAS = [-0.0329, -0.0718, -0.0851]
+
+
+GGUF_NOT_A_DIT = ("text_encoder", "gemma", "qwen", "clip", "t5", "llava", "vae")
+
+
+ZANIME_COMPONENTS_REPO = "SeeSee21/Z-Anime"
+ZANIME_COMPONENTS_PREFIX = "diffusers"
+ZIMAGE_UPSTREAM_REPO = "Tongyi-MAI/Z-Image-Turbo"
+ZANIME_GGUF_REPO = "SeeSee21/Z-Anime"
+ZANIME_DEFAULT_DIT = ZANIME_GGUF_REPO
+ZANIME_DEFAULT_STEPS = 30
+ZANIME_DEFAULT_GUIDANCE = 3.0
+ZANIME_DEFAULT_SIZE = 512
+ZANIME_DEFAULT_SAMPLER = "Euler Ancestral"
+ZANIME_DEFAULT_SIGMAS = "Beta"
+ZANIME_SAMPLERS = FLOW_SAMPLERS
+ZANIME_DEFAULT_SHIFT = 6.0
+ZANIME_DEFAULT_CFG_TRUNC = 1.0
+ZANIME_MAX_SEQUENCE_LENGTH = 512
+ZANIME_TOKEN_LIMIT = ZANIME_MAX_SEQUENCE_LENGTH
+ZANIME_SIZE_MULTIPLE = 16
+QWEN_TEMPLATE_MIN_TOKENS = 5
+ZANIME_TEXT_ENCODER_DTYPE = torch.bfloat16
+
+ZIMAGE_COMPONENTS_REPO = "Tongyi-MAI/Z-Image-Turbo"
+ZIMAGE_GGUF_REPO = "leejet/Z-Image-Turbo-GGUF"
+ZIMAGE_DEFAULT_DIT = ZIMAGE_GGUF_REPO
+ZIMAGE_DEFAULT_STEPS = 8
+ZIMAGE_DEFAULT_GUIDANCE = 0.0
+ZIMAGE_DEFAULT_SIZE = 512
+ZIMAGE_DEFAULT_SAMPLER = "Euler"
+ZIMAGE_DEFAULT_SIGMAS = "Default"
+ZIMAGE_DEFAULT_SHIFT = 3.0
+ZIMAGE_DEFAULT_CFG_TRUNC = 1.0
+ZIMAGE_MAX_SEQUENCE_LENGTH = 512
+ZIMAGE_TOKEN_LIMIT = ZIMAGE_MAX_SEQUENCE_LENGTH
+ZIMAGE_SIZE_MULTIPLE = 16
+ZIMAGE_SAMPLERS = FLOW_SAMPLERS
+ZIMAGE_TEXT_ENCODER_DTYPE = torch.bfloat16
+
+
+def cast_floats(value, dtype):
+    if torch.is_tensor(value):
+        return value.to(dtype) if value.is_floating_point() else value
+    if isinstance(value, (list, tuple)):
+        return type(value)(cast_floats(item, dtype) for item in value)
+    return value
+
+
+class _LoaderComplaints(stdlib_logging.Handler):
+    def __init__(self):
+        super().__init__(level=stdlib_logging.WARNING)
+        self.messages = []
+
+    def emit(self, record):
+        try:
+            self.messages.append(record.getMessage())
+        except Exception:  # noqa: BLE001, S110
+            pass
+
+
+@contextlib.contextmanager
+def report_loader_complaints():
+    handler = _LoaderComplaints()
+    logger = stdlib_logging.getLogger("diffusers")
+    logger.addHandler(handler)
+    try:
+        yield
+    finally:
+        logger.removeHandler(handler)
+
+    for message in handler.messages:
+        lowered = message.lower()
+        if any(
+            word in lowered
+            for word in ("unexpected", "missing", "not used", "mismatch")
+        ):
+            update_status(f"The loader reported: {message.strip()}")
+
+
+def rank_gguf_variant(name, prefer, avoid):
+    lowered = name.lower()
+    if any(token in lowered for token in avoid):
+        return 2
+    if prefer and any(token in lowered for token in prefer):
+        return 0
+    return 1
+
+
+def resolve_gguf_in_repo(repo, preference, prefer=(), avoid=()):
+    try:
+        from huggingface_hub import list_repo_files
+
+        names = list_repo_files(repo)
+    except Exception as e:
+        raise ModelError(
+            f"Could not read {repo} to pick a quantization ({e}). Give the "
+            "DiT field a specific .gguf file or URL instead."
+        ) from e
+
+    every_gguf = [name for name in names if name.lower().endswith(".gguf")]
+    files = sorted(
+        name
+        for name in every_gguf
+        if not any(token in name.lower() for token in GGUF_NOT_A_DIT)
+    )
+    if files and (prefer or avoid):
+        best = min(rank_gguf_variant(name, prefer, avoid) for name in files)
+        files = [
+            name for name in files if rank_gguf_variant(name, prefer, avoid) == best
+        ]
+    if not files:
+        if every_gguf:
+            raise ModelError(
+                f"{repo} has GGUF files but none of them look like a "
+                f"transformer: {', '.join(sorted(every_gguf)[:4])}. Give the "
+                "DiT field the exact file you want."
+            )
+        return None
+
+    for wanted in preference:
+        for name in files:
+            if wanted in name.lower():
+                return f"https://huggingface.co/{repo}/{name}"
+
+    try:
+        from huggingface_hub import HfApi
+
+        sizes = {
+            sibling.rfilename: sibling.size
+            for sibling in HfApi().model_info(repo, files_metadata=True).siblings
+            if sibling.size
+        }
+        files.sort(key=lambda name: sizes.get(name, float("inf")))
+    except Exception as e:  # noqa: BLE001
+        print(f"Could not size the files in {repo}: {e}. Going by name.")
+
+    return f"https://huggingface.co/{repo}/{files[0]}"
+
+
+def _accepts_custom_sigmas(scheduler_cls):
+    try:
+        import inspect
+
+        return "sigmas" in inspect.signature(scheduler_cls.set_timesteps).parameters
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def apply_sigma_schedule(config, sigmas):
+    key = SIGMA_CONFIG_KEYS.get(sigmas)
+    if key is None:
+        return config
+    for other in SIGMA_CONFIG_KEYS.values():
+        config[other] = False
+    if sigmas == "Beta":
+        try:
+            import scipy.stats  # noqa: F401
+        except Exception:  # noqa: BLE001
+            print(
+                "Beta sigmas need scipy, which is not installed. Falling back "
+                "to the schedule the checkpoint ships with."
+            )
+            return config
+    config[key] = True
+    return config
+
+
+def flow_sigmas_usable(scheduler):
+    try:
+        scheduler.set_timesteps(8)
+        sigmas = scheduler.sigmas
+    except Exception:  # noqa: BLE001
+        return True
+    try:
+        return bool(torch.isfinite(sigmas).all()) and float(sigmas.max()) <= 1.001
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def build_flow_scheduler(
+    sampler, base_scheduler, shift=None, dynamic_shifting=None, sigmas=None
+):
     config = dict(base_scheduler.config)
+    config.pop("_use_default_values", None)
+    if sigmas:
+        config = apply_sigma_schedule(config, sigmas)
 
     if shift is None:
         shift = config.get("shift", 1.0)
@@ -491,25 +729,45 @@ def build_anima_scheduler(sampler, base_scheduler, shift=None):
     if shift <= 0.0:
         shift = 1.0
 
+    if dynamic_shifting is not None:
+        config["use_dynamic_shifting"] = bool(dynamic_shifting)
+
+    scheduler = _build_flow_scheduler(sampler, config, shift)
+    if not sigmas or flow_sigmas_usable(scheduler):
+        return scheduler
+
+    update_status(
+        f"{sigmas} sigmas come out on the wrong scale for {sampler} and "
+        "would give a blank image, so this is running the sampler's own "
+        "spacing instead."
+    )
+    plain = dict(config)
+    for key in SIGMA_CONFIG_KEYS.values():
+        plain[key] = False
+    return _build_flow_scheduler(sampler, plain, shift)
+
+
+def _build_flow_scheduler(sampler, config, shift):
     if sampler == "Euler Ancestral":
         return FlowMatchEulerDiscreteScheduler.from_config(
             config, shift=shift, stochastic_sampling=True
         )
 
     if sampler == "UniPC":
+        spacing = {key: bool(config.get(key)) for key in SIGMA_CONFIG_KEYS.values()}
         return UniPCMultistepScheduler(
             num_train_timesteps=int(config.get("num_train_timesteps", 1000)),
             solver_order=2,
             prediction_type="flow_prediction",
             use_flow_sigmas=True,
             flow_shift=shift,
+            **spacing,
         )
 
     return FlowMatchEulerDiscreteScheduler.from_config(config, shift=shift)
 
 
 def bind_scheduler_generator(scheduler, generator):
-    # Make sure seeds stay reproducible.
     if generator is None:
         return
     if not getattr(scheduler.config, "stochastic_sampling", False):
@@ -529,10 +787,9 @@ _anima_step_hook = None
 _anima_stop_check = None
 
 # isort: on
-# autopep8: on
 
 
-class AnimaError(Exception):
+class ModelError(Exception):
     pass
 
 
@@ -590,7 +847,7 @@ def _install_cosmos_torchvision_shim():
     try:
         import torchvision  # noqa: F401
 
-        return  # Nothing to shim.
+        return
     except Exception:  # noqa: BLE001, S110
         pass
     try:
@@ -2440,10 +2697,1053 @@ def describe_torch_build():
     return ", ".join(parts)
 
 
+Z_SEQ_MULTIPLE = 32
+Z_ADALN_EMBED_DIM = 256
+Z_FREQUENCY_EMBEDDING_SIZE = 256
+Z_MAX_PERIOD = 10000
+Z_ROPE_THETA = 256.0
+Z_ROPE_AXES_DIMS = (32, 48, 48)
+Z_ROPE_AXES_LENS = (1536, 512, 512)
+
+
+class ZRMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-5):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        output = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return output * self.weight
+
+
+class ZTimestepEmbedder(nn.Module):
+    def __init__(
+        self,
+        out_size,
+        mid_size=1024,
+        frequency_embedding_size=Z_FREQUENCY_EMBEDDING_SIZE,
+    ):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(frequency_embedding_size, mid_size, bias=True),
+            nn.SiLU(),
+            nn.Linear(mid_size, out_size, bias=True),
+        )
+        self.frequency_embedding_size = frequency_embedding_size
+
+    @staticmethod
+    def timestep_embedding(t, dim, max_period=Z_MAX_PERIOD):
+        half = dim // 2
+        freqs = torch.exp(
+            -math.log(max_period)
+            * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device)
+            / half
+        )
+        args = t[:, None].float() * freqs[None]
+        return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+
+    def forward(self, t):
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        weight = self.mlp[0].weight
+        dtype = weight.dtype if weight.is_floating_point() else torch.float32
+        return self.mlp(t_freq.to(dtype))
+
+
+class ZFeedForward(nn.Module):
+    def __init__(self, dim, hidden_dim):
+        super().__init__()
+        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
+        self.w2 = nn.Linear(hidden_dim, dim, bias=False)
+        self.w3 = nn.Linear(dim, hidden_dim, bias=False)
+
+    def forward(self, x):
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+
+
+def apply_rotary_emb(x, cos, sin):
+    x = x.float().unflatten(-1, (-1, 2))
+    x_even = x[..., 0]
+    x_odd = x[..., 1]
+    out = torch.stack((x_even * cos - x_odd * sin, x_even * sin + x_odd * cos), dim=-1)
+    return out.flatten(-2)
+
+
+class ZAttention(nn.Module):
+    def __init__(self, dim, n_heads, n_kv_heads, qk_norm=True, eps=1e-5):
+        super().__init__()
+        self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads
+        self.head_dim = dim // n_heads
+        if n_heads % n_kv_heads:
+            raise ModelError(
+                f"{n_heads} query heads do not divide into {n_kv_heads} key "
+                "heads, so they cannot be shared between them."
+            )
+
+        self.to_q = nn.Linear(dim, n_heads * self.head_dim, bias=False)
+        self.to_k = nn.Linear(dim, n_kv_heads * self.head_dim, bias=False)
+        self.to_v = nn.Linear(dim, n_kv_heads * self.head_dim, bias=False)
+        self.to_out = nn.ModuleList(
+            [nn.Linear(n_heads * self.head_dim, dim, bias=False)]
+        )
+
+        self.norm_q = ZRMSNorm(self.head_dim, eps=eps) if qk_norm else None
+        self.norm_k = ZRMSNorm(self.head_dim, eps=eps) if qk_norm else None
+
+    def forward(self, x, cos, sin):
+        query = self.to_q(x).unflatten(-1, (self.n_heads, -1))
+        key = self.to_k(x).unflatten(-1, (self.n_kv_heads, -1))
+        value = self.to_v(x).unflatten(-1, (self.n_kv_heads, -1))
+
+        if self.norm_q is not None:
+            query = self.norm_q(query)
+        if self.norm_k is not None:
+            key = self.norm_k(key)
+
+        dtype = value.dtype
+        query = apply_rotary_emb(query, cos, sin).to(dtype)
+        key = apply_rotary_emb(key, cos, sin).to(dtype)
+
+        if self.n_kv_heads != self.n_heads:
+            repeats = self.n_heads // self.n_kv_heads
+            key = key.repeat_interleave(repeats, dim=1)
+            value = value.repeat_interleave(repeats, dim=1)
+
+        out = F.scaled_dot_product_attention(
+            query.transpose(0, 1).unsqueeze(0),
+            key.transpose(0, 1).unsqueeze(0),
+            value.transpose(0, 1).unsqueeze(0),
+        )
+        out = out.squeeze(0).transpose(0, 1).flatten(1)
+        return self.to_out[0](out.to(dtype))
+
+
+class ZTransformerBlock(nn.Module):
+    def __init__(
+        self,
+        dim,
+        n_heads,
+        n_kv_heads,
+        norm_eps,
+        qk_norm,
+        modulation=True,
+        ffn_hidden=None,
+    ):
+        super().__init__()
+        self.modulation = modulation
+        self.attention = ZAttention(dim, n_heads, n_kv_heads, qk_norm, norm_eps)
+        self.feed_forward = ZFeedForward(
+            dim=dim, hidden_dim=ffn_hidden or int(dim / 3 * 8)
+        )
+        self.attention_norm1 = ZRMSNorm(dim, eps=norm_eps)
+        self.ffn_norm1 = ZRMSNorm(dim, eps=norm_eps)
+        self.attention_norm2 = ZRMSNorm(dim, eps=norm_eps)
+        self.ffn_norm2 = ZRMSNorm(dim, eps=norm_eps)
+        if modulation:
+            self.adaLN_modulation = nn.ModuleList(
+                [nn.Linear(min(dim, Z_ADALN_EMBED_DIM), 4 * dim, bias=True)]
+            )
+
+    def forward(self, x, cos, sin, adaln_input=None):
+        if not self.modulation:
+            x = x + self.attention_norm2(
+                self.attention(self.attention_norm1(x), cos, sin)
+            )
+            return x + self.ffn_norm2(self.feed_forward(self.ffn_norm1(x)))
+
+        scale_msa, gate_msa, scale_mlp, gate_mlp = self.adaLN_modulation[0](
+            adaln_input
+        ).chunk(4, dim=-1)
+        gate_msa, gate_mlp = gate_msa.tanh(), gate_mlp.tanh()
+        scale_msa, scale_mlp = 1.0 + scale_msa, 1.0 + scale_mlp
+
+        attn_out = self.attention(self.attention_norm1(x) * scale_msa, cos, sin)
+        x = x + gate_msa * self.attention_norm2(attn_out)
+        return x + gate_mlp * self.ffn_norm2(
+            self.feed_forward(self.ffn_norm1(x) * scale_mlp)
+        )
+
+
+class ZFinalLayer(nn.Module):
+    def __init__(self, hidden_size, out_features):
+        super().__init__()
+        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.linear = nn.Linear(hidden_size, out_features, bias=True)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(min(hidden_size, Z_ADALN_EMBED_DIM), hidden_size, bias=True),
+        )
+
+    def forward(self, x, c):
+        scale = 1.0 + self.adaLN_modulation(c)
+        return self.linear(self.norm_final(x) * scale)
+
+
+class ZRopeEmbedder:
+    def __init__(
+        self, theta=Z_ROPE_THETA, axes_dims=Z_ROPE_AXES_DIMS, axes_lens=Z_ROPE_AXES_LENS
+    ):
+        self.axes_dims = tuple(axes_dims)
+        self.axes_lens = tuple(axes_lens)
+        self.cos = None
+        self.sin = None
+        self.theta = theta
+
+    def _build(self, device):
+        cos, sin = [], []
+        for dim, length in zip(self.axes_dims, self.axes_lens):
+            freqs = 1.0 / (
+                self.theta
+                ** (torch.arange(0, dim, 2, dtype=torch.float64, device=device) / dim)
+            )
+            positions = torch.arange(length, dtype=torch.float64, device=device)
+            angles = torch.outer(positions, freqs).float()
+            cos.append(torch.cos(angles))
+            sin.append(torch.sin(angles))
+        self.cos, self.sin = cos, sin
+
+    def __call__(self, ids):
+        if self.cos is None or self.cos[0].device != ids.device:
+            self._build(ids.device)
+        cos = torch.cat(
+            [self.cos[i][ids[:, i]] for i in range(len(self.axes_dims))], -1
+        )
+        sin = torch.cat(
+            [self.sin[i][ids[:, i]] for i in range(len(self.axes_dims))], -1
+        )
+        return cos.unsqueeze(1), sin.unsqueeze(1)
+
+
+def _coordinate_grid(size, start, device):
+    axes = [
+        torch.arange(x0, x0 + span, dtype=torch.long, device=device)
+        for x0, span in zip(start, size)
+    ]
+    return torch.stack(torch.meshgrid(axes, indexing="ij"), dim=-1).flatten(0, 2)
+
+
+class ZImageTransformer(nn.Module):
+    def __init__(
+        self,
+        in_channels=16,
+        dim=3840,
+        n_layers=30,
+        n_refiner_layers=2,
+        n_heads=30,
+        n_kv_heads=30,
+        norm_eps=1e-5,
+        qk_norm=True,
+        cap_feat_dim=2560,
+        patch_size=2,
+        f_patch_size=1,
+        ffn_hidden=None,
+        t_embedder_mid=1024,
+        rope_theta=Z_ROPE_THETA,
+        t_scale=1000.0,
+        axes_dims=Z_ROPE_AXES_DIMS,
+        axes_lens=Z_ROPE_AXES_LENS,
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = in_channels
+        self.dim = dim
+        self.patch_size = patch_size
+        self.f_patch_size = f_patch_size
+        self.t_scale = t_scale
+        self.key = f"{patch_size}-{f_patch_size}"
+        if ffn_hidden is None:
+            ffn_hidden = int(dim / 3 * 8)
+
+        patch_features = f_patch_size * patch_size * patch_size * in_channels
+        self.all_x_embedder = nn.ModuleDict(
+            {self.key: nn.Linear(patch_features, dim, bias=True)}
+        )
+        self.all_final_layer = nn.ModuleDict(
+            {self.key: ZFinalLayer(dim, patch_features)}
+        )
+
+        def block(modulation):
+            return ZTransformerBlock(
+                dim, n_heads, n_kv_heads, norm_eps, qk_norm, modulation, ffn_hidden
+            )
+
+        self.noise_refiner = nn.ModuleList(
+            [block(True) for _ in range(n_refiner_layers)]
+        )
+        self.context_refiner = nn.ModuleList(
+            [block(False) for _ in range(n_refiner_layers)]
+        )
+        self.layers = nn.ModuleList([block(True) for _ in range(n_layers)])
+
+        self.t_embedder = ZTimestepEmbedder(
+            min(dim, Z_ADALN_EMBED_DIM), mid_size=t_embedder_mid
+        )
+        self.cap_embedder = nn.Sequential(
+            ZRMSNorm(cap_feat_dim, eps=norm_eps),
+            nn.Linear(cap_feat_dim, dim, bias=True),
+        )
+
+        self.x_pad_token = nn.Parameter(torch.zeros((1, dim)))
+        self.cap_pad_token = nn.Parameter(torch.zeros((1, dim)))
+
+        if dim // n_heads != sum(axes_dims):
+            raise ModelError(
+                f"A head is {dim // n_heads} wide but the rotary axes come "
+                f"to {sum(axes_dims)}. They have to be the same number: the "
+                "rotation fills the head exactly."
+            )
+        self.rope_embedder = ZRopeEmbedder(rope_theta, axes_dims, axes_lens)
+
+    @property
+    def dtype(self):
+        for parameter in self.parameters():
+            if parameter.is_floating_point():
+                return parameter.dtype
+        return torch.float32
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+    def _patchify(self, image):
+        pH = pW = self.patch_size
+        pF = self.f_patch_size
+        channels, frames, height, width = image.size()
+        f_tokens, h_tokens, w_tokens = frames // pF, height // pH, width // pW
+        image = image.view(channels, f_tokens, pF, h_tokens, pH, w_tokens, pW)
+        image = image.permute(1, 3, 5, 2, 4, 6, 0)
+        return (
+            image.reshape(f_tokens * h_tokens * w_tokens, pF * pH * pW * channels),
+            (f_tokens, h_tokens, w_tokens),
+        )
+
+    def _unpatchify(self, tokens, grid):
+        pH = pW = self.patch_size
+        pF = self.f_patch_size
+        f_tokens, h_tokens, w_tokens = grid
+        return (
+            tokens[: f_tokens * h_tokens * w_tokens]
+            .view(f_tokens, h_tokens, w_tokens, pF, pH, pW, self.out_channels)
+            .permute(6, 0, 3, 1, 4, 2, 5)
+            .reshape(self.out_channels, f_tokens * pF, h_tokens * pH, w_tokens * pW)
+        )
+
+    @staticmethod
+    def _pad_to_multiple(features, multiple):
+        extra = (-len(features)) % multiple
+        if not extra:
+            return features, 0
+        return torch.cat([features, features[-1:].repeat(extra, 1)], dim=0), extra
+
+    def forward(self, x, timestep, cap_feats):
+        """x: [C, F, H, W]; timestep: scalar tensor; cap_feats: [cap_len, D]."""
+        device = x.device
+        adaln_input = self.t_embedder((timestep.reshape(1) * self.t_scale).to(device))[
+            0
+        ]
+
+        cap_len = len(cap_feats)
+        cap_feats, cap_pad = self._pad_to_multiple(cap_feats, Z_SEQ_MULTIPLE)
+        cap_ids = _coordinate_grid((cap_len + cap_pad, 1, 1), (1, 0, 0), device)
+
+        image, grid = self._patchify(x)
+        image_len = len(image)
+        image, image_pad = self._pad_to_multiple(image, Z_SEQ_MULTIPLE)
+        image_ids = _coordinate_grid(grid, (cap_len + cap_pad + 1, 0, 0), device)
+        if image_pad:
+            image_ids = torch.cat(
+                [image_ids, image_ids.new_zeros((image_pad, 3))], dim=0
+            )
+
+        image = self.all_x_embedder[self.key](image)
+        if image_pad:
+            image[image_len:] = self.x_pad_token.to(image.dtype)
+        image_cos, image_sin = self.rope_embedder(image_ids)
+        for layer in self.noise_refiner:
+            image = layer(image, image_cos, image_sin, adaln_input)
+
+        cap_feats = self.cap_embedder(cap_feats)
+        if cap_pad:
+            cap_feats[cap_len:] = self.cap_pad_token.to(cap_feats.dtype)
+        cap_cos, cap_sin = self.rope_embedder(cap_ids)
+        for layer in self.context_refiner:
+            cap_feats = layer(cap_feats, cap_cos, cap_sin)
+
+        unified = torch.cat([image, cap_feats], dim=0)
+        cos = torch.cat([image_cos, cap_cos], dim=0)
+        sin = torch.cat([image_sin, cap_sin], dim=0)
+        for layer in self.layers:
+            unified = layer(unified, cos, sin, adaln_input)
+
+        unified = self.all_final_layer[self.key](unified, adaln_input)
+        return self._unpatchify(unified, grid)
+
+
+Z_STRIP_PREFIXES = ("model.diffusion_model.", "diffusion_model.", "model.", "net.")
+
+Z_NAME_ALIASES = (
+    ("x_embedder.", "all_x_embedder.2-1."),
+    ("final_layer.", "all_final_layer.2-1."),
+    (".attention.q_norm.", ".attention.norm_q."),
+    (".attention.k_norm.", ".attention.norm_k."),
+    (".attention.out.", ".attention.to_out.0."),
+)
+
+
+def normalize_z_image_key(name):
+    for prefix in Z_STRIP_PREFIXES:
+        if name.startswith(prefix):
+            name = name[len(prefix) :]
+            break
+    for source, target in Z_NAME_ALIASES:
+        if source.startswith("."):
+            name = name.replace(source, target)
+        elif name.startswith(source):
+            name = target + name[len(source) :]
+    return name
+
+
+class ZQuantLinear(nn.Linear):
+    def __init__(self, in_features, out_features, bias=False, device=None):
+        super().__init__(in_features, out_features, bias, device)
+        self.compute_dtype = torch.float32
+        self.loras = {}
+
+    def add_lora(self, adapter, down, up, scale=1.0):
+        self.loras[adapter] = (
+            down.to(self.compute_dtype),
+            up.to(self.compute_dtype),
+            float(scale),
+        )
+
+    def set_lora_scale(self, adapter, scale):
+        if adapter in self.loras:
+            down, up, _ = self.loras[adapter]
+            self.loras[adapter] = (down, up, float(scale))
+
+    def clear_loras(self):
+        self.loras = {}
+
+    def _weight(self):
+        weight = self.weight
+        quant_type = getattr(weight, "quant_type", None)
+        if quant_type is None:
+            return weight.to(self.compute_dtype)
+        from diffusers.quantizers.gguf.utils import dequantize_gguf_tensor
+
+        return dequantize_gguf_tensor(weight).to(self.compute_dtype)
+
+    def forward(self, inputs):
+        inputs = inputs.to(self.compute_dtype)
+        bias = None if self.bias is None else self.bias.to(self.compute_dtype)
+        output = F.linear(inputs, self._weight(), bias)
+        for down, up, scale in self.loras.values():
+            if scale:
+                output = output + scale * F.linear(F.linear(inputs, down), up)
+        return output
+
+
+def promote_to_quant_linear(model, path):
+    module = model.get_submodule(path)
+    if isinstance(module, ZQuantLinear):
+        return module
+    if not isinstance(module, nn.Linear):
+        return None
+    replacement = ZQuantLinear(
+        module.in_features,
+        module.out_features,
+        bias=module.bias is not None,
+        device="meta",
+    )
+    replacement._parameters["weight"] = module.weight
+    if module.bias is not None:
+        replacement._parameters["bias"] = module.bias
+    owner_path, _, attribute = path.rpartition(".")
+    owner = model.get_submodule(owner_path) if owner_path else model
+    setattr(owner, attribute, replacement)
+    return replacement
+
+
+def _quantized(tensor):
+    return getattr(tensor, "quant_type", None) is not None
+
+
+def _fits_expected(shape, expected):
+    if shape == expected:
+        return True
+    stripped = tuple(d for d in shape if d != 1)
+    return stripped == tuple(d for d in expected if d != 1)
+
+
+def _dequantize(tensor):
+    if not _quantized(tensor):
+        return tensor.to(torch.float32) if tensor.is_floating_point() else tensor
+    from diffusers.quantizers.gguf.utils import dequantize_gguf_tensor
+
+    return dequantize_gguf_tensor(tensor).to(torch.float32)
+
+
+def _logical_shape(tensor):
+    return tuple(getattr(tensor, "quant_shape", None) or tensor.shape)
+
+
+def split_fused_attention(state):
+    fused = [
+        name
+        for name in state
+        if name.endswith((".attention.qkv.weight", ".attention.qkv.bias"))
+    ]
+    for name in fused:
+        prefix, _, suffix = name.rpartition(".")
+        prefix = prefix[: -len(".attention.qkv")]
+        tensor = state.pop(name)
+        rows = int(_logical_shape(tensor)[0])
+
+        norm = state.get(f"{prefix}.attention.norm_q.weight")
+        shape = _logical_shape(tensor)
+        head_dim = int(_logical_shape(norm)[0]) if norm is not None else 0
+        hidden = int(shape[1]) if len(shape) > 1 else 0
+        queries = keys = rows // 3
+        if head_dim and hidden and hidden % head_dim == 0:
+            queries = hidden
+            shared = rows - queries
+            if shared > 0 and shared % (2 * head_dim) == 0:
+                keys = shared // 2
+            else:
+                queries = keys = rows // 3
+
+        state[f"{prefix}.attention.to_q.{suffix}"] = tensor[:queries]
+        state[f"{prefix}.attention.to_k.{suffix}"] = tensor[queries : queries + keys]
+        state[f"{prefix}.attention.to_v.{suffix}"] = tensor[queries + keys :]
+    return state
+
+
+def read_z_image_state_dict(path):
+    path = str(path)
+    if path.lower().endswith(".gguf"):
+        from diffusers.models.model_loading_utils import load_gguf_checkpoint
+
+        raw = load_gguf_checkpoint(path)
+    else:
+        from safetensors.torch import load_file
+
+        raw = load_file(path)
+
+    state = {}
+    for name, tensor in raw.items():
+        state[normalize_z_image_key(name)] = tensor
+    return split_fused_attention(state)
+
+
+def detect_z_image_config(state):
+    def shape_of(key):
+        tensor = state.get(key)
+        return None if tensor is None else _logical_shape(tensor)
+
+    x_embed = shape_of("all_x_embedder.2-1.weight")
+    if x_embed is None:
+        raise ModelError(
+            "This file has no all_x_embedder.2-1.weight, so it is not a "
+            "Z-Image diffusion transformer."
+        )
+    dim, patch_features = int(x_embed[0]), int(x_embed[1])
+
+    patch_size, f_patch_size = 2, 1
+    in_channels = patch_features // (patch_size * patch_size * f_patch_size)
+
+    cap = shape_of("cap_embedder.1.weight")
+    cap_feat_dim = int(cap[1]) if cap else 2560
+
+    def count(prefix):
+        best = -1
+        for name in state:
+            if not name.startswith(prefix):
+                continue
+            piece = name[len(prefix) :].split(".", 1)[0]
+            if piece.isdigit():
+                best = max(best, int(piece))
+        return best + 1
+
+    n_layers = count("layers.") or 30
+    n_refiner_layers = max(count("noise_refiner."), count("context_refiner.")) or 2
+
+    q_norm = shape_of("layers.0.attention.norm_q.weight")
+    if q_norm:
+        head_dim = int(q_norm[0])
+        n_heads = dim // head_dim
+    else:
+        head_dim, n_heads = 128, dim // 128
+    to_k = shape_of("layers.0.attention.to_k.weight")
+    n_kv_heads = int(to_k[0]) // head_dim if to_k else n_heads
+
+    w1 = shape_of("layers.0.feed_forward.w1.weight")
+    ffn_hidden = int(w1[0]) if w1 else None
+    t_mid = shape_of("t_embedder.mlp.0.weight")
+    t_embedder_mid = int(t_mid[0]) if t_mid else 1024
+
+    if head_dim != sum(Z_ROPE_AXES_DIMS):
+        raise ModelError(
+            f"This checkpoint has a head dimension of {head_dim}, but "
+            f"Z-Image's rotary embedding is built for "
+            f"{sum(Z_ROPE_AXES_DIMS)}. This is not a Z-Image DiT."
+        )
+
+    return dict(
+        in_channels=in_channels,
+        dim=dim,
+        n_layers=n_layers,
+        n_refiner_layers=n_refiner_layers,
+        n_heads=n_heads,
+        n_kv_heads=n_kv_heads,
+        cap_feat_dim=cap_feat_dim,
+        patch_size=patch_size,
+        f_patch_size=f_patch_size,
+        ffn_hidden=ffn_hidden,
+        t_embedder_mid=t_embedder_mid,
+    )
+
+
+def build_z_image_transformer(state, config=None, progress=None):
+    config = config or detect_z_image_config(state)
+    with torch.device("meta"):
+        model = ZImageTransformer(**config)
+
+    packed = set()
+    for name, tensor in state.items():
+        if not name.endswith(".weight"):
+            continue
+        parent = name[: -len(".weight")]
+        try:
+            module = model.get_submodule(parent)
+        except AttributeError:
+            continue
+        if not isinstance(module, nn.Linear) or isinstance(module, ZQuantLinear):
+            continue
+        if not (_quantized(tensor) or tensor.dtype != torch.float32):
+            continue
+        replacement = ZQuantLinear(
+            module.in_features,
+            module.out_features,
+            bias=module.bias is not None,
+            device="meta",
+        )
+        owner_name, _, attribute = parent.rpartition(".")
+        setattr(
+            model.get_submodule(owner_name) if owner_name else model,
+            attribute,
+            replacement,
+        )
+        packed.add(name)
+
+    expected = {name: tuple(p.shape) for name, p in model.state_dict().items()}
+    missing = set(expected)
+    unexpected = []
+
+    for name, tensor in state.items():
+        if name not in expected:
+            unexpected.append(name)
+            continue
+        shape = tuple(getattr(tensor, "quant_shape", None) or tensor.shape)
+        wanted = expected[name]
+        if not _fits_expected(shape, wanted):
+            raise ModelError(
+                f"{name} is {shape} in this checkpoint but the DiT wants "
+                f"{wanted}. This file is not the model it claims."
+            )
+        if name not in packed:
+            tensor = _dequantize(tensor)
+            if tuple(tensor.shape) != wanted:
+                tensor = tensor.reshape(wanted)
+        if not isinstance(tensor, nn.Parameter):
+            tensor = nn.Parameter(tensor, requires_grad=False)
+
+        owner_path, _, attribute = name.rpartition(".")
+        owner = model.get_submodule(owner_path) if owner_path else model
+        owner._parameters[attribute] = tensor
+        missing.discard(name)
+
+    if missing:
+        raise ModelError(
+            f"This checkpoint is missing {len(missing)} of the DiT's tensors, "
+            f"starting with {sorted(missing)[0]}."
+        )
+    if unexpected and progress is not None:
+        progress(
+            f"Ignored {len(unexpected)} tensors this DiT has no use for, "
+            f"starting with {unexpected[0]}."
+        )
+    model.eval()
+    model.requires_grad_(False)
+    return model
+
+
+Z_BASE_IMAGE_SEQ_LEN = 256
+Z_MAX_IMAGE_SEQ_LEN = 4096
+Z_BASE_SHIFT = 0.5
+Z_MAX_SHIFT = 1.15
+
+
+def z_image_shift(
+    image_seq_len,
+    base_seq_len=Z_BASE_IMAGE_SEQ_LEN,
+    max_seq_len=Z_MAX_IMAGE_SEQ_LEN,
+    base_shift=Z_BASE_SHIFT,
+    max_shift=Z_MAX_SHIFT,
+):
+    slope = (max_shift - base_shift) / (max_seq_len - base_seq_len)
+    return image_seq_len * slope + base_shift - slope * base_seq_len
+
+
+class ZImageOutput:
+    def __init__(self, images):
+        self.images = images
+
+
+class NativeZImagePipeline:
+    def __init__(
+        self,
+        transformer=None,
+        vae=None,
+        text_encoder=None,
+        tokenizer=None,
+        scheduler=None,
+    ):
+        self.transformer = transformer
+        self.vae = vae
+        self.text_encoder = text_encoder
+        self.tokenizer = tokenizer
+        self.scheduler = scheduler
+
+        from diffusers.image_processor import VaeImageProcessor
+
+        factor = 8
+        if vae is not None and hasattr(vae, "config"):
+            factor = 2 ** (len(vae.config.block_out_channels) - 1)
+        self.vae_scale_factor = factor
+        self.image_processor = VaeImageProcessor(vae_scale_factor=factor)
+
+    def to(self, *args, **kwargs):
+        for component in (self.transformer, self.vae, self.text_encoder):
+            if component is not None and hasattr(component, "to"):
+                component.to(*args, **kwargs)
+        return self
+
+    @property
+    def components(self):
+        return {
+            "transformer": self.transformer,
+            "vae": self.vae,
+            "text_encoder": self.text_encoder,
+            "tokenizer": self.tokenizer,
+            "scheduler": self.scheduler,
+        }
+
+    def _format(self, text):
+        messages = [{"role": "user", "content": text or ""}]
+        try:
+            return self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=True,
+            )
+        except TypeError:
+            return self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+
+    def _encode_one(self, text, max_sequence_length):
+        inputs = self.tokenizer(
+            [self._format(text)],
+            padding=False,
+            max_length=max_sequence_length,
+            truncation=True,
+            return_tensors="pt",
+        )
+        mask = inputs.attention_mask.bool()
+        outputs = self.text_encoder(
+            input_ids=inputs.input_ids,
+            attention_mask=mask,
+            output_hidden_states=True,
+        )
+        hidden = outputs.hidden_states[-2]
+        return hidden[0][mask[0]].to(torch.float32)
+
+    def encode_prompt(
+        self,
+        prompt,
+        do_classifier_free_guidance=False,
+        negative_prompt=None,
+        max_sequence_length=512,
+        **kwargs,
+    ):
+        if self.text_encoder is None:
+            raise ModelError("The text encoder is not loaded.")
+        if isinstance(prompt, (list, tuple)):
+            prompt = prompt[0] if prompt else ""
+        embeds = [self._encode_one(prompt, max_sequence_length)]
+        if not do_classifier_free_guidance:
+            return embeds, []
+        if isinstance(negative_prompt, (list, tuple)):
+            negative_prompt = negative_prompt[0] if negative_prompt else ""
+        return embeds, [self._encode_one(negative_prompt or "", max_sequence_length)]
+
+    def _set_timesteps(self, num_inference_steps, image_seq_len):
+        config = getattr(self.scheduler, "config", {})
+        get = config.get if hasattr(config, "get") else (lambda _name, d: d)
+        kwargs = {}
+        if get("use_dynamic_shifting", False):
+            kwargs["mu"] = z_image_shift(
+                image_seq_len,
+                get("base_image_seq_len", Z_BASE_IMAGE_SEQ_LEN),
+                get("max_image_seq_len", Z_MAX_IMAGE_SEQ_LEN),
+                get("base_shift", Z_BASE_SHIFT),
+                get("max_shift", Z_MAX_SHIFT),
+            )
+        self.scheduler.set_timesteps(num_inference_steps, **kwargs)
+        return self.scheduler.timesteps
+
+    @torch.no_grad()
+    def __call__(
+        self,
+        prompt=None,
+        prompt_embeds=None,
+        negative_prompt_embeds=None,
+        negative_prompt=None,
+        height=1024,
+        width=1024,
+        num_inference_steps=8,
+        guidance_scale=0.0,
+        cfg_truncation=1.0,
+        max_sequence_length=512,
+        generator=None,
+        output_type="pil",
+        callback_on_step_end=None,
+        callback_on_step_end_tensor_inputs=None,
+        **kwargs,
+    ):
+        transformer = self.transformer
+        if transformer is None:
+            raise ModelError("The diffusion transformer is not loaded.")
+
+        step = self.vae_scale_factor * 2
+        if height % step or width % step:
+            raise ModelError(
+                f"{width}x{height} does not divide by {step}, which is what "
+                "the VAE and the DiT's 2x2 patches need between them."
+            )
+
+        if prompt_embeds is None:
+            prompt_embeds, negative_prompt_embeds = self.encode_prompt(
+                prompt, guidance_scale > 0.0, negative_prompt, max_sequence_length
+            )
+        cap = (
+            prompt_embeds[0]
+            if isinstance(prompt_embeds, (list, tuple))
+            else prompt_embeds
+        )
+        negative_cap = None
+        if negative_prompt_embeds is not None and len(negative_prompt_embeds):
+            negative_cap = (
+                negative_prompt_embeds[0]
+                if isinstance(negative_prompt_embeds, (list, tuple))
+                else negative_prompt_embeds
+            )
+
+        latent_height = height // self.vae_scale_factor
+        latent_width = width // self.vae_scale_factor
+        latents = torch.randn(
+            (1, transformer.in_channels, latent_height, latent_width),
+            generator=generator,
+            dtype=torch.float32,
+        )
+
+        image_seq_len = (latent_height // 2) * (latent_width // 2)
+        timesteps = self._set_timesteps(num_inference_steps, image_seq_len)
+
+        do_cfg = float(guidance_scale) > 0.0 and negative_cap is not None
+        total = len(timesteps)
+
+        for index, t in enumerate(timesteps):
+            if float(t) == 0.0 and index == total - 1:
+                if callback_on_step_end is not None:
+                    callback_on_step_end(self, index, t, {"latents": latents})
+                continue
+
+            timestep = (1000.0 - float(t)) / 1000.0
+            timestep_tensor = torch.tensor([timestep], dtype=torch.float32)
+
+            scale = float(guidance_scale)
+            if (
+                do_cfg
+                and cfg_truncation is not None
+                and float(cfg_truncation) <= 1
+                and timestep > float(cfg_truncation)
+            ):
+                scale = 0.0
+
+            x = latents[0].unsqueeze(1)
+            conditional = transformer(x, timestep_tensor, cap).float()
+            pred = conditional
+            if do_cfg and scale > 0.0:
+                negative = transformer(x, timestep_tensor, negative_cap).float()
+                pred = conditional + scale * (conditional - negative)
+
+            noise_pred = -pred.squeeze(1).unsqueeze(0)
+            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
+            if callback_on_step_end is not None:
+                callback_on_step_end(self, index, t, {"latents": latents})
+
+        if output_type == "latent":
+            return ZImageOutput([latents])
+
+        image = self.decode_latents(latents)
+        return ZImageOutput(
+            self.image_processor.postprocess(image, output_type=output_type)
+        )
+
+    def decode_latents(self, latents):
+        config = self.vae.config
+        shift = getattr(config, "shift_factor", None) or 0.0
+        scaled = latents.to(torch.float32) / config.scaling_factor + shift
+        return self.vae.decode(scaled.to(self.vae.dtype), return_dict=False)[0]
+
+
+Z_LORA_DOWN_SUFFIXES = (".lora_A.weight", ".lora_down.weight", ".lora_a.weight")
+Z_LORA_UP_SUFFIXES = (".lora_B.weight", ".lora_up.weight", ".lora_b.weight")
+Z_LORA_PREFIXES = (
+    "transformer.",
+    "diffusion_model.",
+    "model.diffusion_model.",
+    "lora_unet_",
+    "lora_transformer_",
+    "base_model.model.",
+)
+
+
+def _lora_target(key, suffix, known):
+    name = key[: -len(suffix)]
+    for prefix in Z_LORA_PREFIXES:
+        if name.startswith(prefix):
+            name = name[len(prefix) :]
+            break
+    name = name.replace(".default", "")
+    candidates = [normalize_z_image_key(name)]
+    if "_" in name and candidates[0] not in known:
+        candidates.append(normalize_z_image_key(name.replace("_", ".")))
+        candidates.append(
+            normalize_z_image_key(
+                name.replace("_", ".")
+                .replace("to.q", "to_q")
+                .replace("to.k", "to_k")
+                .replace("to.v", "to_v")
+                .replace("to.out", "to_out")
+                .replace("norm.q", "norm_q")
+                .replace("norm.k", "norm_k")
+                .replace("feed.forward", "feed_forward")
+                .replace("attention.norm", "attention_norm")
+                .replace("ffn.norm", "ffn_norm")
+                .replace("noise.refiner", "noise_refiner")
+                .replace("context.refiner", "context_refiner")
+                .replace("adaLN.modulation", "adaLN_modulation")
+            )
+        )
+    for candidate in candidates:
+        if candidate in known:
+            return candidate
+    return None
+
+
+def apply_z_image_lora(model, state_dict, adapter="lora", scale=1.0):
+    known = {
+        name for name, module in model.named_modules() if isinstance(module, nn.Linear)
+    }
+    pairs = {}
+    for key in state_dict:
+        for suffix in Z_LORA_DOWN_SUFFIXES:
+            if key.endswith(suffix):
+                target = _lora_target(key, suffix, known)
+                pairs.setdefault(target or key, {})["down"] = key
+                pairs.setdefault(target or key, {})["matched"] = target
+                break
+        else:
+            for suffix in Z_LORA_UP_SUFFIXES:
+                if key.endswith(suffix):
+                    target = _lora_target(key, suffix, known)
+                    pairs.setdefault(target or key, {})["up"] = key
+                    pairs.setdefault(target or key, {})["matched"] = target
+                    break
+
+    applied, skipped = 0, []
+    for target, parts in pairs.items():
+        matched = parts.get("matched")
+        if matched is None or "down" not in parts or "up" not in parts:
+            skipped.append(target)
+            continue
+        down = state_dict[parts["down"]].to(torch.float32)
+        up = state_dict[parts["up"]].to(torch.float32)
+
+        rank = down.shape[0]
+        alpha_key = parts["down"].rsplit(".lora", 1)[0] + ".alpha"
+        alpha = state_dict.get(alpha_key)
+        effective = float(scale)
+        if alpha is not None and rank:
+            effective *= float(alpha.item()) / rank
+
+        module = promote_to_quant_linear(model, matched)
+        if module is None:
+            skipped.append(target)
+            continue
+        if down.shape[1] != module.in_features or up.shape[0] != module.out_features:
+            skipped.append(target)
+            continue
+        module.add_lora(adapter, down, up, effective)
+        applied += 1
+
+    return applied, skipped
+
+
+def set_z_image_lora_scale(model, adapter, scale):
+    for module in model.modules():
+        if isinstance(module, ZQuantLinear):
+            module.set_lora_scale(adapter, scale)
+
+
+def clear_z_image_loras(model):
+    for module in model.modules():
+        if isinstance(module, ZQuantLinear):
+            module.clear_loras()
+
+
 class GeneratePane:
     name = "generate"
     mode_label = "Generate"
     output_label = "Generated Image"
+
+    model_name = "Anima"
+    model_label = "DiT (GGUF):"
+    browse_title = "Select Anima GGUF (diffusion transformer)"
+    count_tokenizer = "Qwen/Qwen3-0.6B"
+    count_tokenizer_subfolder = None
+
+    default_dit = ANIMA_DEFAULT_DIT
+    default_steps = ANIMA_DEFAULT_STEPS
+    default_guidance = ANIMA_DEFAULT_GUIDANCE
+    default_size = ANIMA_DEFAULT_SIZE
+    default_sampler = ANIMA_DEFAULT_SAMPLER
+    default_shift = ANIMA_DEFAULT_SHIFT
+    samplers = ANIMA_SAMPLERS
+    token_limit = ANIMA_TOKEN_LIMIT
+    size_multiple = 64
+    max_steps = 100
+    max_sequence_length = None
+    converts_loras = True
+    latent_rgb_factors = ANIMA_LATENT_RGB_FACTORS
+    latent_rgb_bias = ANIMA_LATENT_RGB_BIAS
 
     def __init__(self, window):
         self.window = window
@@ -2451,6 +3751,7 @@ class GeneratePane:
         self.pipe = None
         self._base_scheduler = None
         self._loaded_adapters = {}
+        self._prompt_cache = None
         self.generating = False
         self.loading_model = False
         self.stop_event = threading.Event()
@@ -2462,17 +3763,12 @@ class GeneratePane:
         self.preview_shown = False
         self._total_steps = 0
         self._latent_rgb_weight = torch.tensor(
-            ANIMA_LATENT_RGB_FACTORS, dtype=torch.float32
+            self.latent_rgb_factors, dtype=torch.float32
         )
-        self._latent_rgb_bias = torch.tensor(ANIMA_LATENT_RGB_BIAS, dtype=torch.float32)
+        self._latent_rgb_bias = torch.tensor(self.latent_rgb_bias, dtype=torch.float32)
 
-        try:
-            from transformers import AutoTokenizer
-
-            self.tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
-        except Exception as e:  # noqa: BLE001
-            print(f"Warning: Could not load the tokenizer for token counting: {e}.")
-            self.tokenizer = None
+        self.tokenizer = None
+        self._tokenizer_tried = False
 
     @property
     def busy(self):
@@ -2488,13 +3784,13 @@ class GeneratePane:
         scrolled.add(controls_box)
 
         model_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
-        model_label = Gtk.Label(label="DiT (GGUF):")
+        model_label = Gtk.Label(label=self.model_label)
         model_label.set_size_request(100, -1)
         model_label.set_xalign(0)
         model_box.pack_start(model_label, False, False, 0)
 
         self.model_entry = Gtk.Entry()
-        self.model_entry.set_text(ANIMA_DEFAULT_DIT)
+        self.model_entry.set_text(self.default_dit)
         model_box.pack_start(self.model_entry, True, True, 0)
 
         model_browse_btn = Gtk.Button(label="Browse...")
@@ -2568,11 +3864,11 @@ class GeneratePane:
 
         self.width_spin = Gtk.SpinButton()
         width_adj = Gtk.Adjustment(
-            value=ANIMA_DEFAULT_SIZE,
+            value=self.default_size,
             lower=256,
             upper=1536,
-            step_increment=64,
-            page_increment=128,
+            step_increment=self.size_multiple,
+            page_increment=self.size_multiple * 2,
         )
         self.width_spin.set_adjustment(width_adj)
         self.width_spin.set_size_request(90, -1)
@@ -2580,11 +3876,11 @@ class GeneratePane:
 
         self.height_spin = Gtk.SpinButton()
         height_adj = Gtk.Adjustment(
-            value=ANIMA_DEFAULT_SIZE,
+            value=self.default_size,
             lower=256,
             upper=1536,
-            step_increment=64,
-            page_increment=128,
+            step_increment=self.size_multiple,
+            page_increment=self.size_multiple * 2,
         )
         self.height_spin.set_adjustment(height_adj)
         self.height_spin.set_size_request(90, -1)
@@ -2599,9 +3895,9 @@ class GeneratePane:
 
         self.steps_spin = Gtk.SpinButton()
         steps_adj = Gtk.Adjustment(
-            value=ANIMA_DEFAULT_STEPS,
+            value=self.default_steps,
             lower=1,
-            upper=100,
+            upper=self.max_steps,
             step_increment=1,
             page_increment=5,
         )
@@ -2618,7 +3914,7 @@ class GeneratePane:
 
         self.guidance_spin = Gtk.SpinButton()
         guidance_adj = Gtk.Adjustment(
-            value=ANIMA_DEFAULT_GUIDANCE,
+            value=self.default_guidance,
             lower=0.0,
             upper=20.0,
             step_increment=0.5,
@@ -2637,9 +3933,9 @@ class GeneratePane:
         sampler_box.pack_start(sampler_label, False, False, 0)
 
         self.sampler_combo = Gtk.ComboBoxText()
-        for sampler_name in ANIMA_SAMPLERS:
+        for sampler_name in self.samplers:
             self.sampler_combo.append(sampler_name, sampler_name)
-        self.sampler_combo.set_active_id(ANIMA_DEFAULT_SAMPLER)
+        self.sampler_combo.set_active_id(self.default_sampler)
 
         sampler_box.pack_start(self.sampler_combo, False, False, 0)
         controls_box.pack_start(sampler_box, False, False, 0)
@@ -2652,7 +3948,7 @@ class GeneratePane:
 
         self.shift_spin = Gtk.SpinButton()
         shift_adj = Gtk.Adjustment(
-            value=ANIMA_DEFAULT_SHIFT,
+            value=self.default_shift,
             lower=0.10,
             upper=12.0,
             step_increment=0.05,
@@ -2663,6 +3959,8 @@ class GeneratePane:
         self.shift_spin.set_size_request(100, -1)
         shift_box.pack_start(self.shift_spin, False, False, 0)
         controls_box.pack_start(shift_box, False, False, 0)
+
+        self._extra_controls(controls_box)
 
         seed_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
         seed_label = Gtk.Label(label="Seed:")
@@ -2694,7 +3992,7 @@ class GeneratePane:
         preview_label.set_size_request(100, -1)
         preview_label.set_xalign(0)
         preview_box.pack_start(preview_label, False, False, 0)
-        self.preview_check = Gtk.CheckButton(label="Generate a rough preview each step")
+        self.preview_check = Gtk.CheckButton(label="Generate a preview each step")
         self.preview_check.set_active(True)
         preview_box.pack_start(self.preview_check, False, False, 0)
         controls_box.pack_start(preview_box, False, False, 0)
@@ -2713,7 +4011,7 @@ class GeneratePane:
         trigger_scroll.add(self.trigger_text)
         controls_box.pack_start(trigger_scroll, False, False, 0)
 
-        self.trigger_token_label = Gtk.Label(label=f"0/{ANIMA_TOKEN_LIMIT}")
+        self.trigger_token_label = Gtk.Label(label=f"0/{self.token_limit}")
         self.trigger_token_label.set_xalign(1)
         controls_box.pack_start(self.trigger_token_label, False, False, 0)
 
@@ -2731,7 +4029,7 @@ class GeneratePane:
         prompt_scroll.add(self.prompt_text)
         controls_box.pack_start(prompt_scroll, False, False, 0)
 
-        self.prompt_token_label = Gtk.Label(label=f"0/{ANIMA_TOKEN_LIMIT}")
+        self.prompt_token_label = Gtk.Label(label=f"0/{self.token_limit}")
         self.prompt_token_label.set_xalign(1)
         controls_box.pack_start(self.prompt_token_label, False, False, 0)
 
@@ -2749,7 +4047,7 @@ class GeneratePane:
         neg_prompt_scroll.add(self.neg_prompt_text)
         controls_box.pack_start(neg_prompt_scroll, False, False, 0)
 
-        self.neg_prompt_token_label = Gtk.Label(label=f"0/{ANIMA_TOKEN_LIMIT}")
+        self.neg_prompt_token_label = Gtk.Label(label=f"0/{self.negative_token_limit}")
         self.neg_prompt_token_label.set_xalign(1)
         controls_box.pack_start(self.neg_prompt_token_label, False, False, 0)
 
@@ -2815,8 +4113,25 @@ class GeneratePane:
         if self.load_thread and self.load_thread.is_alive():
             self.load_thread.join(timeout=LOAD_THREAD_TIMEOUT)
 
+    def _counting_tokenizer(self):
+        if self.tokenizer is not None or self._tokenizer_tried:
+            return self.tokenizer
+        self._tokenizer_tried = True
+        try:
+            from transformers import AutoTokenizer
+
+            kwargs = {}
+            if self.count_tokenizer_subfolder:
+                kwargs["subfolder"] = self.count_tokenizer_subfolder
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.count_tokenizer, **kwargs
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"Warning: Could not load the tokenizer for token counting: {e}.")
+        return self.tokenizer
+
     def count_tokens(self, text):
-        if not self.tokenizer or not text:
+        if not text or self._counting_tokenizer() is None:
             return 0
         try:
             return len(self.tokenizer.encode(text, add_special_tokens=False))
@@ -2825,9 +4140,6 @@ class GeneratePane:
             return 0
 
     def on_text_changed(self, widget=None):
-        if not self.tokenizer:
-            return
-
         trigger_buffer = self.trigger_text.get_buffer()
         trigger_text = trigger_buffer.get_text(
             trigger_buffer.get_start_iter(), trigger_buffer.get_end_iter(), False
@@ -2843,6 +4155,18 @@ class GeneratePane:
             neg_buffer.get_start_iter(), neg_buffer.get_end_iter(), False
         )
 
+        if not (trigger_text or prompt_text or neg_text):
+            for label in (
+                self.trigger_token_label,
+                self.prompt_token_label,
+                self.neg_prompt_token_label,
+            ):
+                self._update_token_label(label, 0)
+            return
+
+        if self._counting_tokenizer() is None:
+            return
+
         trigger_tokens = self.count_tokens(trigger_text)
 
         if trigger_text and prompt_text:
@@ -2857,19 +4181,26 @@ class GeneratePane:
 
         self._update_token_label(self.trigger_token_label, trigger_tokens)
         self._update_token_label(self.prompt_token_label, combined_tokens)
-        self._update_token_label(self.neg_prompt_token_label, neg_tokens)
+        self._update_token_label(
+            self.neg_prompt_token_label, neg_tokens, self.negative_token_limit
+        )
 
-    def _update_token_label(self, label, count):
-        if count > ANIMA_TOKEN_LIMIT:
+    @property
+    def negative_token_limit(self):
+        return self.token_limit
+
+    def _update_token_label(self, label, count, limit=None):
+        if limit is None:
+            limit = self.token_limit
+        warning = int(limit * TOKEN_WARNING_FRACTION)
+        if count > limit:
             color = "red"
-        elif count > ANIMA_TOKEN_WARNING:
+        elif count > warning:
             color = "orange"
         else:
             color = "green"
-        weight = ' weight="bold"' if count > ANIMA_TOKEN_WARNING else ""
-        label.set_markup(
-            f'<span foreground="{color}"{weight}>{count}/{ANIMA_TOKEN_LIMIT}</span>'
-        )
+        weight = ' weight="bold"' if count > warning else ""
+        label.set_markup(f'<span foreground="{color}"{weight}>{count}/{limit}</span>')
 
     def load_settings(self, settings):
         self._loading_settings = True
@@ -2889,7 +4220,7 @@ class GeneratePane:
                 self.steps_spin.set_value(settings["steps"])
             if "guidance" in settings:
                 self.guidance_spin.set_value(settings["guidance"])
-            if settings.get("sampler") in ANIMA_SAMPLERS:
+            if settings.get("sampler") in self.samplers:
                 self.sampler_combo.set_active_id(settings["sampler"])
             if "shift" in settings:
                 self.shift_spin.set_value(settings["shift"])
@@ -2935,7 +4266,7 @@ class GeneratePane:
             "loras": [],
             "steps": int(self.steps_spin.get_value()),
             "guidance": spin_value(self.guidance_spin),
-            "sampler": self.sampler_combo.get_active_id() or ANIMA_DEFAULT_SAMPLER,
+            "sampler": self.sampler_combo.get_active_id() or self.default_sampler,
             "shift": spin_value(self.shift_spin),
             "seed": int(self.seed_spin.get_value()),
             "width": int(self.width_spin.get_value()),
@@ -3027,7 +4358,7 @@ class GeneratePane:
 
     def on_browse_model(self, button):
         dialog = Gtk.FileChooserDialog(
-            title="Select Anima GGUF (diffusion transformer)",
+            title=self.browse_title,
             parent=self.window,
             action=Gtk.FileChooserAction.OPEN,
         )
@@ -3149,6 +4480,12 @@ class GeneratePane:
         self.load_thread = threading.Thread(target=self.load_model_thread, daemon=True)
         self.load_thread.start()
 
+    def _prepare_source(self, model_name):
+        model_name = normalize_huggingface_url((model_name or "").strip())
+        if not model_name:
+            raise ModelError(f"No {self.model_name} DiT specified.")
+        return model_name
+
     def _check_stop_loading(self, cleanup_pipe=False):
         if self.stop_event.is_set():
             update_status("Interrupted by user.")
@@ -3163,7 +4500,7 @@ class GeneratePane:
             if self._check_stop_loading():
                 return
 
-            model_name = self.model_entry.get_text().strip()
+            model_name = self._prepare_source(self.model_entry.get_text().strip())
 
             if self.pipe is not None:
                 if self._check_stop_loading():
@@ -3173,12 +4510,16 @@ class GeneratePane:
                 self.pipe = None
                 self._base_scheduler = None
                 self._loaded_adapters = {}
+                self._prompt_cache = None
                 gc.collect()
+
+            for released in self.window.release_other_models(self):
+                update_status(f"Unloaded {released} to make room. Reload it later.")
 
             if self._check_stop_loading():
                 return
 
-            self.pipe = self._load_anima_pipeline(model_name)
+            self.pipe = self._load_pipeline(model_name)
             if self.pipe is None:
                 return
 
@@ -3208,18 +4549,21 @@ class GeneratePane:
             GLib.idle_add(self._enable_load)
         finally:
             self.loading_model = False
+            if self.pipe is None:
+                GLib.idle_add(self._enable_load)
+                GLib.idle_add(self._model_released)
             GLib.idle_add(self._hide_stop_button)
 
-    def _load_anima_pipeline(self, dit_source):
+    def _load_pipeline(self, dit_source):
         if not ANIMA_AVAILABLE:
-            raise AnimaError("Anima requires diffusers >= 0.39.0 and gguf.")
+            raise ModelError("Anima requires diffusers >= 0.39.0 and gguf.")
 
         _install_cosmos_torchvision_shim()
         _install_anima_denoise_hook()
 
         dit_source = normalize_huggingface_url((dit_source or "").strip())
         if not dit_source:
-            raise AnimaError("No Anima DiT specified.")
+            raise ModelError("No Anima DiT specified.")
 
         update_status(f"Loading Anima DiT from {dit_source}...")
         transformer = CosmosTransformer3DModel.from_single_file(
@@ -3237,7 +4581,6 @@ class GeneratePane:
 
         update_status(f"Loading Anima components from {ANIMA_COMPONENTS_REPO}...")
         pipe = ModularPipeline.from_pretrained(ANIMA_COMPONENTS_REPO)
-        # We supply our own GGUF transformer via update_components() below.
         comp_names = (
             getattr(pipe, "pretrained_component_names", None)
             or getattr(pipe, "component_names", None)
@@ -3251,11 +4594,13 @@ class GeneratePane:
                 loaded_selectively = True
         except Exception as e:  # noqa: BLE001
             print(
-                f"Warning: selective component load failed: {e}. "
-                "Loading all components."
+                f"Warning: selective component load failed: {e}. Loading all "
+                "components, including a float32 transformer that the GGUF "
+                "one below replaces. That is a lot of memory to touch twice."
             )
         if not loaded_selectively:
             pipe.load_components(torch_dtype=torch.float32)
+            gc.collect()
 
         if self._check_stop_loading():
             del transformer
@@ -3265,6 +4610,7 @@ class GeneratePane:
 
         update_status("Injecting the GGUF DiT into the pipeline...")
         pipe.update_components(transformer=transformer)
+        gc.collect()
 
         try:
             vae = getattr(pipe, "vae", None)
@@ -3300,7 +4646,6 @@ class GeneratePane:
             pass
         return None
 
-    # XXX: Finish me.
     def _convert_kohya_anima_lora(self, state_dict):
         attn_map = {
             "self_attn_q_proj": "attn1.to_q",
@@ -3403,14 +4748,17 @@ class GeneratePane:
             update_status(f"Loading LoRA {label}...")
             try:
                 converted = None
-                local_file = self._lora_local_file(
-                    lora_info["path"], lora_info["weight_name"]
+                local_file = (
+                    self._lora_local_file(lora_info["path"], lora_info["weight_name"])
+                    if self.converts_loras
+                    else None
                 )
                 if local_file is not None and str(local_file).endswith(".safetensors"):
                     from safetensors.torch import load_file
 
                     raw = load_file(str(local_file))
-                    converted = self._convert_kohya_anima_lora(raw)
+                    converted = self._convert_lora(raw)
+                    del raw
 
                 if converted is not None:
                     n = sum(1 for k in converted if k.endswith("lora_A.weight"))
@@ -3436,7 +4784,6 @@ class GeneratePane:
         if not adapter_weights:
             return
 
-        # https://github.com/huggingface/diffusers/issues/12047
         try:
             self.pipe.set_adapters(
                 list(adapter_weights.keys()),
@@ -3477,6 +4824,22 @@ class GeneratePane:
         self.stop_button.hide()
         self.stop_button.set_sensitive(False)
         return False
+
+    def _model_released(self):
+        self.generate_button.set_sensitive(False)
+        self.load_button.set_label("Load Model and LoRAs")
+        return False
+
+    def release_model(self):
+        if self.pipe is None or self.busy:
+            return False
+        self.pipe = None
+        self._base_scheduler = None
+        self._loaded_adapters = {}
+        self._prompt_cache = None
+        gc.collect()
+        GLib.idle_add(self._model_released)
+        return True
 
     def _hide_stop_button(self):
         self.stop_button.hide()
@@ -3531,21 +4894,27 @@ class GeneratePane:
                 print(f"  -> Sending SIGINT to process (PID {os.getpid()}).")
                 os.kill(os.getpid(), signal.SIGINT)
 
+    def _build_scheduler(self, sampler, base, shift):
+        return build_flow_scheduler(sampler, base, shift)
+
+    def _set_scheduler(self, scheduler):
+        self.pipe.update_components(scheduler=scheduler)
+
     def _apply_sampler(self, sampler, shift=None, generator=None):
         base = self._base_scheduler or getattr(self.pipe, "scheduler", None)
         if base is None or self.pipe is None:
             return
         try:
-            scheduler = build_anima_scheduler(sampler, base, shift)
+            scheduler = self._build_scheduler(sampler, base, shift)
             bind_scheduler_generator(scheduler, generator)
-            self.pipe.update_components(scheduler=scheduler)
+            self._set_scheduler(scheduler)
         except Exception as e:  # noqa: BLE001
             print(
                 f"Warning: could not select sampler '{sampler}': {e}. "
                 "Falling back to the pipeline default."
             )
             try:
-                self.pipe.update_components(scheduler=base)
+                self._set_scheduler(base)
             except Exception:  # noqa: BLE001, S110
                 pass
 
@@ -3571,7 +4940,6 @@ class GeneratePane:
         if self.pipe is None:
             return
         if ClassifierFreeGuidance is None:
-            # Trouble ahead.
             return
         try:
             existing = getattr(self.pipe, "guider", None)
@@ -3587,6 +4955,32 @@ class GeneratePane:
                 f"Warning: could not apply guidance {guidance} to the guider "
                 f"component: {e}. The pipeline's default CFG will be used."
             )
+
+    def _convert_lora(self, state_dict):
+        return self._convert_kohya_anima_lora(state_dict)
+
+    def _begin_generation(self):
+        _set_anima_stop_check(lambda: self.stop_event.is_set())
+        _set_anima_step_hook(self._on_denoise_step)
+
+    def _end_generation(self):
+        _set_anima_step_hook(None)
+        _set_anima_stop_check(None)
+
+    def _extra_controls(self, controls_box):
+        return
+
+    def _extra_metadata(self):
+        return {}
+
+    def _prompt_kwargs(self, prompt, negative_prompt, guidance):
+        return {"prompt": prompt, "negative_prompt": negative_prompt}
+
+    def _pipeline_kwargs(self, guidance, steps):
+        return {}
+
+    def _adjust_size(self, width, height):
+        return width, height
 
     def _png_metadata(self, **params):
         info = PngInfo()
@@ -3638,9 +5032,10 @@ class GeneratePane:
             steps = int(self.steps_spin.get_value())
             guidance = spin_value(self.guidance_spin)
             guidance_text = spin_text(self.guidance_spin)
-            width = int(self.width_spin.get_value())
-            height = int(self.height_spin.get_value())
-            sampler = self.sampler_combo.get_active_id() or ANIMA_DEFAULT_SAMPLER
+            width, height = self._adjust_size(
+                int(self.width_spin.get_value()), int(self.height_spin.get_value())
+            )
+            sampler = self.sampler_combo.get_active_id() or self.default_sampler
             shift = spin_value(self.shift_spin)
             shift_text = spin_text(self.shift_spin)
             seed = int(self.seed_spin.get_value())
@@ -3653,23 +5048,24 @@ class GeneratePane:
             self._refresh_lora_weights()
 
             update_status(
-                f"Generating with Anima ({sampler}, shift {shift_text}) at "
-                f"{width}x{height} with {steps} steps, guidance {guidance_text}, "
-                f"and seed {seed}..."
+                f"Generating with {self.model_name} ({sampler}, shift "
+                f"{shift_text}) at {width}x{height} with {steps} steps, "
+                f"guidance {guidance_text}, and seed {seed}..."
             )
 
-            _set_anima_stop_check(lambda: self.stop_event.is_set())
-            _set_anima_step_hook(self._on_denoise_step)
+            self._begin_generation()
+
+            prompt_kwargs = self._prompt_kwargs(full_prompt, negative_prompt, guidance)
 
             result = None
             with torch.inference_mode():
                 result = self.pipe(
-                    prompt=full_prompt,
-                    negative_prompt=negative_prompt,
                     num_inference_steps=steps,
                     width=width,
                     height=height,
                     generator=generator,
+                    **prompt_kwargs,
+                    **self._pipeline_kwargs(guidance, steps),
                 )
 
                 image = getattr(result, "images", [None])[0] if result else None
@@ -3693,6 +5089,7 @@ class GeneratePane:
                     shift=shift_text,
                     seed=seed,
                     size=f"{width}x{height}",
+                    **self._extra_metadata(),
                 )
                 image.save(str(output_path), format="PNG", pnginfo=info)
 
@@ -3716,8 +5113,7 @@ class GeneratePane:
                 update_status(f"Error generating image: {e}")
                 GLib.idle_add(self.window.set_progress, 0.0, "Failed")
         finally:
-            _set_anima_step_hook(None)
-            _set_anima_stop_check(None)
+            self._end_generation()
             self.generating = False
             GLib.idle_add(self._reset_generate_button)
 
@@ -3737,7 +5133,7 @@ class GeneratePane:
             return
 
         try:
-            data = self._latents_to_rgb_bytes(latents)
+            data = self._preview_bytes(latents, step_index)
             if data is None:
                 return
             rgb_bytes, width, height = data
@@ -3745,15 +5141,18 @@ class GeneratePane:
         except Exception as e:  # noqa: BLE001
             print(f"Preview failed: {e}.", file=sys.stderr)
 
+    def _preview_bytes(self, latents, step_index):
+        return self._latents_to_rgb_bytes(latents)
+
     def _latents_to_rgb_bytes(self, latents):
         try:
             with torch.inference_mode():
                 lat = latents.detach().to(dtype=torch.float32, device="cpu")
-                if lat.dim() == 5:  # [B, C, T, H, W]
+                if lat.dim() == 5:
                     lat = lat[0, :, 0]
-                elif lat.dim() == 4:  # [B, C, H, W]
+                elif lat.dim() == 4:
                     lat = lat[0]
-                elif lat.dim() != 3:  # [C, H, W] expected
+                elif lat.dim() != 3:
                     return None
                 channels = self._latent_rgb_weight.shape[0]
                 if lat.shape[0] < channels:
@@ -3778,11 +5177,11 @@ class GeneratePane:
             )
 
             longest = max(width, height)
-            if longest < PREVIEW_DISPLAY_SIZE:
+            if longest and longest != PREVIEW_DISPLAY_SIZE:
                 scale = PREVIEW_DISPLAY_SIZE / longest
                 pixbuf = pixbuf.scale_simple(
-                    round(width * scale),
-                    round(height * scale),
+                    max(1, round(width * scale)),
+                    max(1, round(height * scale)),
                     GdkPixbuf.InterpType.BILINEAR,
                 )
 
@@ -3833,7 +5232,7 @@ class GeneratePane:
                 update_status(error_msg)
 
     def on_restore_defaults_clicked(self, button):
-        self.model_entry.set_text(ANIMA_DEFAULT_DIT)
+        self.model_entry.set_text(self.default_dit)
         self.preview_check.set_active(True)
 
         for i in range(NUM_LORA_SLOTS):
@@ -3842,12 +5241,12 @@ class GeneratePane:
             weight_name_entry.set_text("")
             weight_spin.set_value(0.5)
 
-        self.width_spin.set_value(ANIMA_DEFAULT_SIZE)
-        self.height_spin.set_value(ANIMA_DEFAULT_SIZE)
-        self.steps_spin.set_value(ANIMA_DEFAULT_STEPS)
-        self.guidance_spin.set_value(ANIMA_DEFAULT_GUIDANCE)
-        self.sampler_combo.set_active_id(ANIMA_DEFAULT_SAMPLER)
-        self.shift_spin.set_value(ANIMA_DEFAULT_SHIFT)
+        self.width_spin.set_value(self.default_size)
+        self.height_spin.set_value(self.default_size)
+        self.steps_spin.set_value(self.default_steps)
+        self.guidance_spin.set_value(self.default_guidance)
+        self.sampler_combo.set_active_id(self.default_sampler)
+        self.shift_spin.set_value(self.default_shift)
         self.seed_spin.set_value(ANIMA_DEFAULT_SEED)
 
         self.trigger_text.get_buffer().set_text("")
@@ -3855,6 +5254,950 @@ class GeneratePane:
         self.neg_prompt_text.get_buffer().set_text("")
 
         update_status("Settings restored to defaults.")
+
+
+class DiffusersPane(GeneratePane):
+    converts_loras = False
+    pipeline_cls = None
+    transformer_cls = None
+    components_repo = None
+    components_prefix = ""
+    component_repos = {}
+    gguf_repo = None
+    gguf_preference = GGUF_QUANT_PREFERENCE
+    gguf_prefer = ()
+    gguf_avoid = ()
+    distilled_tokens = ()
+    text_encoder_dtype = torch.bfloat16
+    text_encoder_name = "text encoder"
+    unquantized_size = "a great deal of"
+    cfg_threshold = 1.0
+    cfg_trunc_kwarg = "cfg_trunc_ratio"
+    default_cfg_trunc = 1.0
+    default_sigmas = DEFAULT_SIGMAS
+    supplies_explicit_sigmas = True
+
+    def __init__(self, window):
+        if (
+            self.supplies_explicit_sigmas
+            and "UniPC" in self.samplers
+            and not _accepts_custom_sigmas(UniPCMultistepScheduler)
+        ):
+            self.samplers = tuple(s for s in self.samplers if s != "UniPC")
+            print(
+                "This diffusers' UniPC cannot take a custom sigma schedule, "
+                f"which {self.model_name} always supplies. Leaving it out."
+            )
+        super().__init__(window)
+
+    def _prepare_source(self, model_name):
+        model_name = normalize_huggingface_url((model_name or "").strip())
+        if not model_name:
+            model_name = self.components_repo
+        if model_name.startswith(UNQUANTIZED_PREFIX):
+            return model_name
+        if not model_name.lower().endswith(".gguf") and is_huggingface_repo(model_name):
+            resolved = resolve_gguf_in_repo(
+                model_name, self.gguf_preference, self.gguf_prefer, self.gguf_avoid
+            )
+            if resolved is not None:
+                self._note_checkpoint(resolved.rsplit("/", 1)[-1], model_name)
+                return resolved
+        else:
+            self._note_checkpoint(model_name.rsplit("/", 1)[-1], None)
+        return model_name
+
+    def _note_checkpoint(self, filename, repo):
+        if repo is not None:
+            update_status(f"Picked {filename} out of {repo}.")
+        lowered = filename.lower()
+        if not any(token in lowered for token in self.distilled_tokens):
+            return
+        update_status(
+            f"{filename} looks like a distilled checkpoint. Those want very "
+            "few steps and little or no guidance, so at the defaults here "
+            "they will spend a long time producing a mess."
+        )
+
+    def _load_transformer(self, dit_source):
+        if dit_source.lower().endswith(".gguf"):
+            update_status(f"Loading the {self.model_name} DiT from {dit_source}...")
+            with report_loader_complaints():
+                return self.transformer_cls.from_single_file(
+                    dit_source,
+                    quantization_config=GGUFQuantizationConfig(
+                        compute_dtype=torch.float32
+                    ),
+                    config=self.components_repo,
+                    subfolder=self._subfolder("transformer"),
+                    torch_dtype=torch.float32,
+                )
+
+        if dit_source.startswith(UNQUANTIZED_PREFIX):
+            dit_source = dit_source[len(UNQUANTIZED_PREFIX) :] or self.components_repo
+
+        dtype = torch.float32
+        update_status(
+            f"Loading an unquantized {self.model_name} DiT from {dit_source} "
+            "in float32. Four bytes a parameter, so check it fits before "
+            "waiting on it."
+        )
+        try:
+            return self.transformer_cls.from_pretrained(
+                dit_source,
+                subfolder=self._subfolder("transformer"),
+                torch_dtype=dtype,
+                low_cpu_mem_usage=True,
+            )
+        except Exception as e:  # noqa: BLE001
+            gc.collect()
+            print(f"No transformer subfolder in {dit_source} ({e}) so trying it bare.")
+            return self.transformer_cls.from_pretrained(
+                dit_source, torch_dtype=dtype, low_cpu_mem_usage=True
+            )
+
+    def _subfolder(self, name):
+        repo, prefix = self._component_source(name)
+        return f"{prefix}/{name}" if prefix else name
+
+    def _component_source(self, name):
+        return self.component_repos.get(
+            name, (self.components_repo, self.components_prefix)
+        )
+
+    def _component_repo(self, name):
+        return self._component_source(name)[0]
+
+    def _check_transformer_weights(self, transformer):
+        empty, bad, total, skipped = [], [], 0, 0
+        try:
+            named = list(transformer.named_parameters())
+        except Exception as e:  # noqa: BLE001
+            print(f"Could not list the transformer weights: {e}.")
+            return
+
+        for name, param in named:
+            total += 1
+            try:
+                data = getattr(param, "data", param)
+                if data.numel() == 0:
+                    continue
+                if data.is_floating_point():
+                    if not torch.isfinite(data).all():
+                        bad.append(name)
+                        continue
+                if bool((data == 0).all()):
+                    empty.append(name)
+            except Exception:  # noqa: BLE001
+                skipped += 1
+
+        if skipped:
+            print(f"{skipped} of {total} weight tensors could not be inspected.")
+        if not total:
+            return
+        if bad:
+            update_status(
+                f"{len(bad)} of {total} weight tensors are not finite, starting "
+                f"with {bad[0]}. This checkpoint will not produce an image."
+            )
+        if len(empty) > total // 20:
+            update_status(
+                f"{len(empty)} of {total} weight tensors are entirely zero, "
+                f"starting with {empty[0]}. This usually means the file was "
+                "converted for another runtime and few of its keys matched, "
+                "which produces noise rather than an error."
+            )
+
+    def _available(self):
+        raise NotImplementedError
+
+    def _load_pipeline(self, dit_source):
+        self._available()
+
+        from transformers import AutoTokenizer
+
+        repo = self.components_repo
+        transformer = self._load_transformer(dit_source)
+        self._check_transformer_weights(transformer)
+        if self._check_stop_loading():
+            del transformer
+            gc.collect()
+            return None
+
+        tokenizer_repo = self._component_repo("tokenizer")
+        if tokenizer_repo != repo:
+            update_status(f"Taking the tokenizer from {tokenizer_repo}.")
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_repo, subfolder=self._subfolder("tokenizer")
+        )
+
+        update_status(f"Loading the VAE and scheduler from {repo}...")
+        vae = AutoencoderKL.from_pretrained(
+            self._component_repo("vae"),
+            subfolder=self._subfolder("vae"),
+            torch_dtype=torch.float32,
+            low_cpu_mem_usage=True,
+        )
+        scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+            self._component_repo("scheduler"), subfolder=self._subfolder("scheduler")
+        )
+
+        if self._check_stop_loading():
+            del transformer, vae
+            gc.collect()
+            return None
+
+        pipe = self.pipeline_cls(
+            transformer=transformer,
+            scheduler=scheduler,
+            vae=vae,
+            text_encoder=None,
+            tokenizer=tokenizer,
+        )
+
+        try:
+            if hasattr(vae, "enable_slicing"):
+                vae.enable_slicing()
+            if hasattr(vae, "enable_tiling"):
+                vae.enable_tiling()
+                update_status("Enabled VAE tiling and slicing.")
+        except Exception as e:  # noqa: BLE001
+            print(f"Warning: {e}.")
+
+        try:
+            pipe.to("cpu")
+        except Exception as e:  # noqa: BLE001
+            print(f"Warning: could not move pipeline to CPU: {e}.")
+
+        self._align_prompt_dtype(pipe)
+
+        if tokenizer is not None:
+            self.tokenizer = tokenizer
+            self._measure_token_budget(pipe, tokenizer)
+            GLib.idle_add(self.on_text_changed, None)
+
+        self._base_scheduler = pipe.scheduler
+        self._prompt_cache = None
+        self._adopt_scheduler_defaults(pipe.scheduler)
+
+        gc.collect()
+        return pipe
+
+    def _adopt_scheduler_defaults(self, scheduler):
+        try:
+            config = dict(scheduler.config)
+            chosen = spin_value(self.shift_spin)
+        except Exception:  # noqa: BLE001
+            return
+
+        if config.get("use_dynamic_shifting"):
+            update_status(
+                f"The {self.model_name} scheduler resolves its own shift. "
+                f"Shift is pinning it to {chosen:g} so the control works."
+            )
+            return
+
+        try:
+            shipped = float(config.get("shift", 1.0))
+        except (TypeError, ValueError):
+            return
+        if abs(shipped - chosen) <= 1e-6:
+            return
+
+        if abs(chosen - float(self.default_shift)) <= 1e-6:
+            GLib.idle_add(self._set_shift, shipped)
+            update_status(
+                f"The checkpoint asks for shift {shipped:g}. Taking it over "
+                f"the default of {float(self.default_shift):g}."
+            )
+            return
+
+        update_status(
+            f"The checkpoint's scheduler asks for shift {shipped:g}, and "
+            f"Shift is set to {chosen:g}. Higher values push the image into "
+            "the last few steps, so previews stay noise for longer."
+        )
+
+    def _set_shift(self, value):
+        self.shift_spin.set_value(value)
+        return False
+
+    def _load_text_encoder(self):
+        from transformers import AutoModel
+
+        return AutoModel.from_pretrained(
+            self._component_repo("text_encoder"),
+            subfolder=self._subfolder("text_encoder"),
+            torch_dtype=self.text_encoder_dtype,
+            low_cpu_mem_usage=True,
+        )
+
+    def _release_text_encoder(self, pipe=None):
+        pipe = pipe if pipe is not None else self.pipe
+        if pipe is None or getattr(pipe, "text_encoder", None) is None:
+            return
+        pipe.text_encoder = None
+        gc.collect()
+        update_status(
+            "Released the text encoder because the denoise loop has no use for it."
+        )
+
+    def _ensure_text_encoder(self):
+        if getattr(self.pipe, "text_encoder", None) is not None:
+            return
+        update_status(
+            f"Loading the {self.text_encoder_name} from "
+            f"{self._component_repo('text_encoder')} to encode this prompt..."
+        )
+        self.pipe.text_encoder = self._load_text_encoder()
+        self._check_vocabularies()
+
+    def _check_vocabularies(self):
+        if self._component_repo("tokenizer") == self._component_repo("text_encoder"):
+            return
+        try:
+            rows = self.pipe.text_encoder.get_input_embeddings().weight.shape[0]
+            tokens = len(self.pipe.tokenizer)
+        except Exception as e:  # noqa: BLE001
+            print(f"Could not compare tokenizer and text encoder: {e}.")
+            return
+        if tokens > rows:
+            update_status(
+                f"The tokenizer has {tokens} tokens but the text encoder only "
+                f"has {rows} embedding rows. They are not the same vocabulary, "
+                "and the prompt will not mean what it says."
+            )
+        else:
+            print(f"Tokenizer {tokens} tokens, text encoder {rows} rows: fits.")
+
+    def _measure_token_budget(self, pipe, tokenizer):
+        return
+
+    def _align_prompt_dtype(self, pipe):
+        dtype = getattr(getattr(pipe, "transformer", None), "dtype", None)
+        if dtype is None:
+            dtype = torch.float32
+        original = pipe.encode_prompt
+
+        def encode_prompt(*args, **kwargs):
+            return cast_floats(original(*args, **kwargs), dtype)
+
+        pipe.encode_prompt = encode_prompt
+
+    def _build_scheduler(self, sampler, base, shift):
+        return build_flow_scheduler(
+            sampler,
+            base,
+            shift,
+            dynamic_shifting=False,
+            sigmas=self.sigmas_combo.get_active_id() or self.default_sigmas,
+        )
+
+    def _set_scheduler(self, scheduler):
+        self.pipe.scheduler = scheduler
+
+    def _apply_guidance(self, guidance):
+        return
+
+    def _convert_lora(self, state_dict):
+        return None
+
+    def _begin_generation(self):
+        return
+
+    def _end_generation(self):
+        return
+
+    def _encode_prompts(self, prompt, negative_prompt, guidance):
+        do_cfg = float(guidance) > self.cfg_threshold
+        key = (prompt, negative_prompt, do_cfg, self.max_sequence_length)
+
+        if self._prompt_cache is None or self._prompt_cache[0] != key:
+            self._ensure_text_encoder()
+            update_status("Encoding the prompt...")
+            with torch.inference_mode():
+                self._prompt_cache = (
+                    key,
+                    self._call_encode_prompt(prompt, negative_prompt, do_cfg),
+                )
+
+        self._release_text_encoder()
+        return self._prompt_cache[1]
+
+    def _pipeline_kwargs(self, guidance, steps):
+        return {
+            "guidance_scale": float(guidance),
+            self.cfg_trunc_kwarg: spin_value(self.cfg_trunc_spin),
+            "max_sequence_length": self.max_sequence_length,
+            "callback_on_step_end": self._on_standard_step,
+            "callback_on_step_end_tensor_inputs": ["latents"],
+        }
+
+    def _on_standard_step(self, pipe, step_index, timestep, callback_kwargs):
+        if self.stop_event.is_set():
+            raise KeyboardInterrupt()
+        self._on_denoise_step(callback_kwargs.get("latents"), step_index)
+        return callback_kwargs
+
+    def _preview_bytes(self, latents, step_index):
+        every = int(spin_value(self.decode_every_spin))
+        if every > 0 and step_index is not None and (int(step_index) + 1) % every == 0:
+            decoded = self._decode_preview(latents)
+            if decoded is not None:
+                return decoded
+        return self._latents_to_rgb_bytes(latents)
+
+    def _decode_preview(self, latents):
+        vae = getattr(self.pipe, "vae", None)
+        processor = getattr(self.pipe, "image_processor", None)
+        if vae is None or processor is None or latents is None:
+            return None
+        try:
+            with torch.inference_mode():
+                scaled = latents.detach().to(dtype=torch.float32)
+                scaled = scaled / vae.config.scaling_factor + vae.config.shift_factor
+                image = vae.decode(scaled, return_dict=False)[0]
+                image = processor.postprocess(image, output_type="np")[0]
+                rgb = (image * 255.0).clip(0, 255).astype(numpy.uint8)
+                height, width, _ = rgb.shape
+                return numpy.ascontiguousarray(rgb).tobytes(), width, height
+        except Exception as e:  # noqa: BLE001
+            print(f"Preview decode failed: {e}. Falling back to the projection.")
+            return None
+        finally:
+            gc.collect()
+
+    def _adjust_size(self, width, height):
+        multiple = self.size_multiple
+        adjusted = tuple(
+            max(multiple, (int(value) // multiple) * multiple)
+            for value in (width, height)
+        )
+        if adjusted != (width, height):
+            update_status(
+                f"Rounded the size to {adjusted[0]}x{adjusted[1]}. Latents pack "
+                f"2x2, so both sides have to be a multiple of {multiple}."
+            )
+        return adjusted
+
+    def _extra_controls(self, controls_box):
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        label = Gtk.Label(label="CFG cutoff:")
+        label.set_size_request(100, -1)
+        label.set_xalign(0)
+        box.pack_start(label, False, False, 0)
+
+        self.cfg_trunc_spin = Gtk.SpinButton()
+        self.cfg_trunc_spin.set_adjustment(
+            Gtk.Adjustment(
+                value=self.default_cfg_trunc,
+                lower=0.0,
+                upper=1.0,
+                step_increment=0.05,
+                page_increment=0.25,
+            )
+        )
+        self.cfg_trunc_spin.set_digits(2)
+        self.cfg_trunc_spin.set_size_request(100, -1)
+        box.pack_start(self.cfg_trunc_spin, False, False, 0)
+        controls_box.pack_start(box, False, False, 0)
+
+        sigmas_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        sigmas_label = Gtk.Label(label="Sigmas:")
+        sigmas_label.set_size_request(100, -1)
+        sigmas_label.set_xalign(0)
+        sigmas_box.pack_start(sigmas_label, False, False, 0)
+
+        self.sigmas_combo = Gtk.ComboBoxText()
+        for name in SIGMA_SCHEDULES:
+            self.sigmas_combo.append(name, name)
+        self.sigmas_combo.set_active_id(self.default_sigmas)
+        sigmas_box.pack_start(self.sigmas_combo, False, False, 0)
+        controls_box.pack_start(sigmas_box, False, False, 0)
+
+        decode_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        decode_label = Gtk.Label(label="Decode every:")
+        decode_label.set_size_request(100, -1)
+        decode_label.set_xalign(0)
+        decode_box.pack_start(decode_label, False, False, 0)
+
+        self.decode_every_spin = Gtk.SpinButton()
+        self.decode_every_spin.set_adjustment(
+            Gtk.Adjustment(
+                value=DEFAULT_DECODE_EVERY,
+                lower=0,
+                upper=100,
+                step_increment=1,
+                page_increment=5,
+            )
+        )
+        self.decode_every_spin.set_size_request(100, -1)
+        decode_box.pack_start(self.decode_every_spin, False, False, 0)
+        decode_box.pack_start(
+            Gtk.Label(label="steps (0 for the rough preview only)"), False, False, 0
+        )
+        controls_box.pack_start(decode_box, False, False, 0)
+
+    def _extra_metadata(self):
+        return {
+            self.cfg_trunc_kwarg: spin_text(self.cfg_trunc_spin),
+            "sigmas": self.sigmas_combo.get_active_id() or self.default_sigmas,
+        }
+
+    def collect_settings(self):
+        settings = super().collect_settings()
+        settings["cfg_trunc"] = spin_value(self.cfg_trunc_spin)
+        settings["decode_every"] = int(spin_value(self.decode_every_spin))
+        settings["sigmas"] = self.sigmas_combo.get_active_id() or self.default_sigmas
+        return settings
+
+    def load_settings(self, settings):
+        super().load_settings(settings)
+        try:
+            for key in ("cfg_trunc", "cfg_trunc_ratio"):
+                if key in settings:
+                    self.cfg_trunc_spin.set_value(float(settings[key]))
+                    break
+            if "decode_every" in settings:
+                self.decode_every_spin.set_value(int(settings["decode_every"]))
+            if settings.get("sigmas") in SIGMA_SCHEDULES:
+                self.sigmas_combo.set_active_id(settings["sigmas"])
+        except Exception as e:  # noqa: BLE001
+            print(f"Error loading settings: {e}.")
+
+    def on_restore_defaults_clicked(self, button):
+        self.cfg_trunc_spin.set_value(self.default_cfg_trunc)
+        self.decode_every_spin.set_value(DEFAULT_DECODE_EVERY)
+        self.sigmas_combo.set_active_id(self.default_sigmas)
+        super().on_restore_defaults_clicked(button)
+
+
+class NativeZImagePane(DiffusersPane):
+    pipeline_cls = NativeZImagePipeline
+    transformer_cls = None
+    text_encoder_name = "Qwen3 text encoder"
+    unquantized_size = "roughly 24 gigabytes against about 4 for"
+    model_label = "DiT (GGUF):"
+    cfg_threshold = 0.0
+    cfg_trunc_kwarg = "cfg_truncation"
+    latent_rgb_factors = FLUX_LATENT_RGB_FACTORS
+    latent_rgb_bias = FLUX_LATENT_RGB_BIAS
+    size_multiple = ZIMAGE_SIZE_MULTIPLE
+    samplers = ZIMAGE_SAMPLERS
+    supplies_explicit_sigmas = False
+    expects_distilled = True
+    distilled_tokens = ("turbo", "distill", "lightning", "-step", "_step")
+
+    def _available(self):
+        if not VAE_AVAILABLE:
+            raise ModelError(
+                f"{self.model_name} needs diffusers for the VAE, the "
+                "scheduler and the GGUF unpacking."
+            )
+
+    def _note_checkpoint(self, filename, repo):
+        if repo is not None:
+            update_status(f"Picked {filename} out of {repo}.")
+        lowered = filename.lower()
+        distilled = any(token in lowered for token in self.distilled_tokens)
+        if distilled == self.expects_distilled:
+            return
+        steps = int(spin_value(self.steps_spin))
+        if distilled:
+            update_status(
+                f"{filename} is a distilled checkpoint, but this tab is set "
+                f"up for one that is not. Distilled Z-Image wants about "
+                f"{ZIMAGE_DEFAULT_STEPS} steps and no guidance at all. At "
+                f"{steps} steps it spends the rest making the image worse."
+            )
+        else:
+            update_status(
+                f"{filename} does not look distilled, but this tab is set up "
+                f"for one that is. Undistilled Z-Image wants nearer fifty "
+                f"steps and guidance around five, so at {steps} steps and "
+                "this tab's guidance it will produce a smear."
+            )
+
+    def _fetch_dit(self, source):
+        path = Path(source)
+        try:
+            if path.is_file():
+                return path
+        except OSError:
+            pass
+        if not is_direct_url(source):
+            raise ModelError(
+                f"{source} is neither a file on disk nor somewhere to "
+                "download one from."
+            )
+
+        if "huggingface.co/" in source:
+            tail = source.split("huggingface.co/", 1)[1].strip("/")
+            parts = tail.split("/")
+            if len(parts) >= 3:
+                repo = "/".join(parts[:2])
+                filename = "/".join(parts[2:])
+                update_status(f"Fetching {filename} from {repo}...")
+                from huggingface_hub import hf_hub_download
+
+                return Path(hf_hub_download(repo_id=repo, filename=filename))
+
+        destination = DIT_DIR / source.rsplit("/", 1)[-1]
+        if destination.is_file():
+            return destination
+
+        def report(done, total):
+            if total:
+                GLib.idle_add(
+                    self.window.set_progress,
+                    done / total,
+                    f"Downloading {_format_size(done)} of {_format_size(total)}",
+                )
+
+        update_status(f"Downloading {destination.name}...")
+        download_model(
+            source,
+            destination,
+            progress=report,
+            stop_check=lambda: self.stop_event.is_set(),
+        )
+        return destination
+
+    def _unquantized_files(self, source):
+        if not is_huggingface_repo(source):
+            raise ModelError(
+                f"{source} is not a repo this can take an unquantized "
+                "transformer out of."
+            )
+        update_status(
+            f"Fetching an unquantized transformer from {source}. That is "
+            f"{self.unquantized_size} a quantized one, so check it fits."
+        )
+        from huggingface_hub import snapshot_download
+
+        local = (
+            Path(snapshot_download(source, allow_patterns=["transformer/*"]))
+            / "transformer"
+        )
+        shards = sorted(local.glob("*.safetensors"))
+        if not shards:
+            raise ModelError(f"{source} has no transformer/*.safetensors.")
+        return shards
+
+    def _load_transformer(self, dit_source):
+        if dit_source.startswith(UNQUANTIZED_PREFIX):
+            repo = dit_source[len(UNQUANTIZED_PREFIX) :] or self.components_repo
+            state = {}
+            for shard in self._unquantized_files(repo):
+                state.update(read_z_image_state_dict(shard))
+        else:
+            local = self._fetch_dit(dit_source)
+            if local.suffix.lower() == ".gguf":
+                try:
+                    import gguf  # noqa: F401
+                except Exception as e:
+                    raise ModelError(
+                        f"{local.name} is a GGUF file, which needs the gguf "
+                        f"package to unpack ({e})."
+                    ) from e
+            update_status(f"Reading the {self.model_name} DiT from {local.name}...")
+            state = read_z_image_state_dict(local)
+
+        if self._check_stop_loading():
+            return None
+
+        config = detect_z_image_config(state)
+        update_status(
+            f"{config['n_layers']} layers of {config['dim']} across "
+            f"{config['n_heads']} heads, {config['n_refiner_layers']} refiner "
+            f"layers, caption features {config['cap_feat_dim']} wide."
+        )
+        with report_loader_complaints():
+            return build_z_image_transformer(state, config, progress=update_status)
+
+    def _check_transformer_weights(self, transformer):
+        return
+
+    def _load_pipeline(self, dit_source):
+        self._available()
+
+        from transformers import AutoTokenizer
+
+        repo = self.components_repo
+        transformer = self._load_transformer(dit_source)
+        if transformer is None or self._check_stop_loading():
+            del transformer
+            gc.collect()
+            return None
+
+        tokenizer_repo = self._component_repo("tokenizer")
+        if tokenizer_repo != repo:
+            update_status(f"Taking the tokenizer from {tokenizer_repo}.")
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_repo, subfolder=self._subfolder("tokenizer")
+        )
+
+        update_status(f"Loading the VAE and scheduler from {repo}...")
+        vae = AutoencoderKL.from_pretrained(
+            self._component_repo("vae"),
+            subfolder=self._subfolder("vae"),
+            torch_dtype=torch.float32,
+            low_cpu_mem_usage=True,
+        )
+        scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+            self._component_repo("scheduler"), subfolder=self._subfolder("scheduler")
+        )
+
+        if self._check_stop_loading():
+            del transformer, vae
+            gc.collect()
+            return None
+
+        pipe = self.pipeline_cls(
+            transformer=transformer,
+            scheduler=scheduler,
+            vae=vae,
+            text_encoder=None,
+            tokenizer=tokenizer,
+        )
+
+        for name, enable in (
+            ("slicing", "enable_slicing"),
+            ("tiling", "enable_tiling"),
+        ):
+            try:
+                if hasattr(vae, enable):
+                    getattr(vae, enable)()
+            except Exception as e:  # noqa: BLE001
+                print(f"Warning: could not turn on VAE {name}: {e}.")
+
+        self._align_prompt_dtype(pipe)
+
+        if tokenizer is not None:
+            self.tokenizer = tokenizer
+            self._measure_token_budget(pipe, tokenizer)
+            GLib.idle_add(self.on_text_changed, None)
+
+        self._base_scheduler = pipe.scheduler
+        self._prompt_cache = None
+        self._loaded_adapters = {}
+        self._adopt_scheduler_defaults(pipe.scheduler)
+
+        gc.collect()
+        return pipe
+
+    def _measure_token_budget(self, pipe, tokenizer):
+        if not getattr(tokenizer, "chat_template", None):
+            update_status(
+                "This tokenizer has no chat template. Z-Image wraps every "
+                "prompt in one before encoding, so without it the text "
+                "encoder sees something it was never trained on and the "
+                "image will show it. Point the tab at a repo whose tokenizer "
+                "has one."
+            )
+            return
+
+        try:
+            wrapped = tokenizer.apply_chat_template(
+                [{"role": "user", "content": ""}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            overhead = len(tokenizer(wrapped, add_special_tokens=False).input_ids)
+        except Exception as e:  # noqa: BLE001
+            print(f"Warning: could not measure the chat template: {e}.")
+            return
+
+        if overhead < QWEN_TEMPLATE_MIN_TOKENS:
+            update_status(
+                f"The chat template here is only {overhead} tokens, which is "
+                "too short to be Qwen3's. The text encoder is being handed "
+                "something it was not trained on, and the image will show it."
+            )
+            return
+
+        limit = max(1, self.max_sequence_length - overhead)
+        if limit == self.token_limit:
+            return
+        self.token_limit = limit
+        update_status(
+            f"Qwen3's chat template takes {overhead} of "
+            f"{self.max_sequence_length} tokens, leaving {limit} for yours."
+        )
+
+    def _call_encode_prompt(self, prompt, negative_prompt, do_cfg):
+        return self.pipe.encode_prompt(
+            prompt,
+            do_classifier_free_guidance=do_cfg,
+            negative_prompt=negative_prompt,
+            max_sequence_length=self.max_sequence_length,
+        )
+
+    def _prompt_kwargs(self, prompt, negative_prompt, guidance):
+        embeds, negative = self._encode_prompts(prompt, negative_prompt, guidance)
+        return {
+            "prompt_embeds": embeds,
+            "negative_prompt_embeds": negative or None,
+        }
+
+    def _pipeline_kwargs(self, guidance, steps):
+        return {
+            "guidance_scale": float(guidance),
+            "cfg_truncation": spin_value(self.cfg_trunc_spin),
+            "max_sequence_length": self.max_sequence_length,
+            "callback_on_step_end": self._on_standard_step,
+        }
+
+    def _lora_state_dict(self, path, weight_name):
+        local = self._lora_local_file(path, weight_name)
+        if local is None:
+            try:
+                found = sorted(Path(path).glob("*.safetensors"))
+            except OSError:
+                found = []
+            if found:
+                local = found[0]
+                if len(found) > 1:
+                    update_status(
+                        f"{path} holds {len(found)} LoRAs; taking "
+                        f"{local.name}. Name one in Weight file to choose."
+                    )
+        if local is None and is_huggingface_repo(path):
+            from huggingface_hub import hf_hub_download
+
+            if weight_name:
+                local = Path(hf_hub_download(repo_id=path, filename=weight_name))
+            else:
+                from huggingface_hub import list_repo_files
+
+                names = [
+                    name
+                    for name in list_repo_files(path)
+                    if name.endswith(".safetensors")
+                ]
+                if not names:
+                    raise ModelError(f"{path} has no .safetensors in it.")
+                local = Path(hf_hub_download(repo_id=path, filename=sorted(names)[0]))
+        if local is None:
+            raise ModelError(f"Could not find a LoRA at {path}.")
+
+        from safetensors.torch import load_file
+
+        return load_file(str(local))
+
+    def _load_loras(self):
+        transformer = getattr(self.pipe, "transformer", None)
+        if transformer is None:
+            return
+        clear_z_image_loras(transformer)
+        self._loaded_adapters = {}
+
+        for index, (entry, (weight_name_entry, weight_spin)) in enumerate(
+            zip(self.lora_entries, self.lora_weight_entries)
+        ):
+            path = entry.get_text().strip()
+            if not path:
+                continue
+            if self._check_stop_loading(cleanup_pipe=True):
+                return
+
+            weight_name = weight_name_entry.get_text().strip()
+            label = f"{path}/{weight_name}" if weight_name else path
+            adapter = f"lora_{index}"
+            update_status(f"Loading LoRA {label}...")
+            try:
+                state = self._lora_state_dict(path, weight_name)
+                applied, skipped = apply_z_image_lora(
+                    transformer, state, adapter, spin_value(weight_spin)
+                )
+                del state
+            except Exception as e:  # noqa: BLE001
+                traceback.print_exc()
+                update_status(f"Warning: could not load LoRA {label}: {e}. Skipping.")
+                continue
+
+            if not applied:
+                update_status(
+                    f"Warning: none of {label} matched this DiT, so it is "
+                    "doing nothing. It was probably trained for another model."
+                )
+                continue
+            self._loaded_adapters[adapter] = index
+            if skipped:
+                update_status(
+                    f"Applied {label} to {applied} modules. {len(skipped)} of "
+                    "its entries matched nothing here."
+                )
+            else:
+                update_status(f"Applied {label} to {applied} modules.")
+        gc.collect()
+
+    def _refresh_lora_weights(self):
+        transformer = getattr(self.pipe, "transformer", None)
+        if transformer is None or not self._loaded_adapters:
+            return
+        for adapter, slot in self._loaded_adapters.items():
+            if slot >= len(self.lora_weight_entries):
+                continue
+            _, weight_spin = self.lora_weight_entries[slot]
+            set_z_image_lora_scale(transformer, adapter, spin_value(weight_spin))
+
+
+class ZImagePane(NativeZImagePane):
+    name = "zimage"
+    mode_label = "Z-Image"
+    output_label = "Generated Image (Z-Image)"
+
+    model_name = "Z-Image"
+    browse_title = "Select a Z-Image GGUF (diffusion transformer)"
+    count_tokenizer = ZIMAGE_COMPONENTS_REPO
+    count_tokenizer_subfolder = "tokenizer"
+
+    components_repo = ZIMAGE_COMPONENTS_REPO
+    text_encoder_dtype = ZIMAGE_TEXT_ENCODER_DTYPE
+
+    default_dit = ZIMAGE_DEFAULT_DIT
+    default_steps = ZIMAGE_DEFAULT_STEPS
+    default_guidance = ZIMAGE_DEFAULT_GUIDANCE
+    default_size = ZIMAGE_DEFAULT_SIZE
+    default_sampler = ZIMAGE_DEFAULT_SAMPLER
+    default_shift = ZIMAGE_DEFAULT_SHIFT
+    default_cfg_trunc = ZIMAGE_DEFAULT_CFG_TRUNC
+    default_sigmas = ZIMAGE_DEFAULT_SIGMAS
+    token_limit = ZIMAGE_TOKEN_LIMIT
+    max_sequence_length = ZIMAGE_MAX_SEQUENCE_LENGTH
+
+
+class ZAnimePane(NativeZImagePane):
+    name = "zanime"
+    mode_label = "Z-Anime"
+    output_label = "Generated Image (Z-Anime)"
+
+    model_name = "Z-Anime"
+    browse_title = "Select a Z-Anime GGUF (diffusion transformer)"
+    count_tokenizer = ZANIME_COMPONENTS_REPO
+    count_tokenizer_subfolder = f"{ZANIME_COMPONENTS_PREFIX}/tokenizer"
+
+    components_repo = ZANIME_COMPONENTS_REPO
+    components_prefix = ZANIME_COMPONENTS_PREFIX
+    component_repos = {"tokenizer": (ZIMAGE_UPSTREAM_REPO, "")}
+    text_encoder_dtype = ZANIME_TEXT_ENCODER_DTYPE
+
+    default_dit = ZANIME_DEFAULT_DIT
+    default_steps = ZANIME_DEFAULT_STEPS
+    default_guidance = ZANIME_DEFAULT_GUIDANCE
+    default_size = ZANIME_DEFAULT_SIZE
+    default_sampler = ZANIME_DEFAULT_SAMPLER
+    default_shift = ZANIME_DEFAULT_SHIFT
+    default_cfg_trunc = ZANIME_DEFAULT_CFG_TRUNC
+    default_sigmas = ZANIME_DEFAULT_SIGMAS
+    token_limit = ZANIME_TOKEN_LIMIT
+    max_sequence_length = ZANIME_MAX_SEQUENCE_LENGTH
+    samplers = ZANIME_SAMPLERS
+    size_multiple = ZANIME_SIZE_MULTIPLE
+    gguf_prefer = ("base",)
+    gguf_avoid = ("distill", "turbo", "lightning")
+    expects_distilled = False
 
 
 class UpscalePane:
@@ -4989,7 +7332,7 @@ class UpscalePane:
                 )
             except BrokenPipeError:
                 raise RuntimeError(
-                    "ffmpeg closed the pipe:\n" + "".join(encoder_errors).strip()
+                    "FFmpeg closed the pipe:\n" + "".join(encoder_errors).strip()
                 )
 
             stopped = self.stop_event.is_set()
@@ -5008,7 +7351,7 @@ class UpscalePane:
 
             if encoder_status != 0:
                 raise RuntimeError(
-                    f"ffmpeg exited with {encoder_status} while encoding:\n"
+                    f"FFmpeg exited with {encoder_status} while encoding:\n"
                     + "".join(encoder_errors).strip()
                 )
             if not stopped and decoder_status not in (0, -13, 255):
@@ -5545,6 +7888,204 @@ def benchmark(target=None):
     return 0
 
 
+def _self_test_schedulers(check):
+    if not ANIMA_AVAILABLE:
+        check("Schedulers: diffusers", False, "not installed")
+        return
+
+    base = FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000, shift=3.0)
+    for sampler in FLOW_SAMPLERS:
+        for spacing in SIGMA_SCHEDULES:
+            label = f"Schedulers: {sampler} + {spacing}"
+            try:
+                scheduler = build_flow_scheduler(sampler, base, 3.0, sigmas=spacing)
+                scheduler.set_timesteps(8)
+                sigmas = scheduler.sigmas
+                timesteps = scheduler.timesteps
+            except Exception as e:  # noqa: BLE001
+                check(label, False, str(e))
+                continue
+            usable = (
+                bool(torch.isfinite(sigmas).all())
+                and float(sigmas.max()) <= 1.001
+                and len(timesteps) == 8
+            )
+            check(label, usable, f"sigma max {float(sigmas.max()):.3f}")
+
+
+def _self_test_zimage(check):
+    if not VAE_AVAILABLE:
+        check("Z-Image: diffusers", False, "not installed")
+        return
+
+    torch.manual_seed(0)
+    shape = dict(
+        in_channels=4,
+        dim=256,
+        n_layers=2,
+        n_refiner_layers=1,
+        n_heads=2,
+        n_kv_heads=2,
+        cap_feat_dim=24,
+    )
+    try:
+        reference = ZImageTransformer(**shape).eval()
+    except Exception as e:  # noqa: BLE001
+        check("Z-Image: builds", False, str(e))
+        return
+    check(
+        "Z-Image: builds",
+        True,
+        f"{sum(p.numel() for p in reference.parameters())} parameters",
+    )
+
+    state = {name: tensor.clone() for name, tensor in reference.state_dict().items()}
+    try:
+        detected = detect_z_image_config(state)
+    except Exception as e:  # noqa: BLE001
+        check("Z-Image: shape detected", False, str(e))
+        return
+    wanted = {key: shape[key] for key in shape}
+    check(
+        "Z-Image: shape detected",
+        all(detected.get(key) == value for key, value in wanted.items()),
+        ", ".join(f"{k}={detected.get(k)}" for k in ("dim", "n_layers", "n_heads")),
+    )
+
+    try:
+        rebuilt = build_z_image_transformer(state, detected)
+    except Exception as e:  # noqa: BLE001
+        check("Z-Image: loads", False, str(e))
+        return
+    check("Z-Image: loads", True, "weights assigned without a copy")
+
+    caption = torch.randn(13, 24)
+    latent = torch.randn(4, 1, 12, 20)
+    timestep = torch.tensor([0.42])
+    try:
+        with torch.inference_mode():
+            want = reference(latent, timestep, caption)
+            got = rebuilt(latent, timestep, caption)
+    except Exception as e:  # noqa: BLE001
+        check("Z-Image: forward", False, str(e))
+        return
+
+    check(
+        "Z-Image: output shape",
+        tuple(got.shape) == tuple(latent.shape),
+        f"got {tuple(got.shape)}",
+    )
+    check("Z-Image: finite", bool(torch.isfinite(got).all()))
+    difference = (want - got).abs().max().item()
+    check(
+        "Z-Image: reload matches", difference < 1e-6, f"max difference {difference:.2e}"
+    )
+
+    flattened = {
+        name: (tensor.reshape(-1) if 1 in tuple(tensor.shape) else tensor)
+        for name, tensor in reference.state_dict().items()
+    }
+    try:
+        flat_model = build_z_image_transformer(flattened, detected)
+        with torch.inference_mode():
+            flat_out = flat_model(latent, timestep, caption)
+        check(
+            "Z-Image: flattened pad tokens",
+            tuple(flat_model.cap_pad_token.shape) == (1, detected["dim"])
+            and (want - flat_out).abs().max().item() < 1e-6,
+        )
+    except Exception as e:  # noqa: BLE001
+        check("Z-Image: flattened pad tokens", False, str(e))
+
+    sdcpp = {}
+    attentions = sorted(
+        name[: -len(".attention.to_q.weight")]
+        for name in state
+        if name.endswith(".attention.to_q.weight")
+    )
+    for name, tensor in state.items():
+        if any(name.startswith(f"{block}.attention.to_") for block in attentions):
+            continue
+        sdcpp[
+            name.replace("all_x_embedder.2-1.", "x_embedder.").replace(
+                "all_final_layer.2-1.", "final_layer."
+            )
+        ] = tensor
+    for block in attentions:
+        sdcpp[f"{block}.attention.qkv.weight"] = torch.cat(
+            [state[f"{block}.attention.to_{part}.weight"] for part in "qkv"], dim=0
+        )
+        sdcpp[f"{block}.attention.out.weight"] = state[
+            f"{block}.attention.to_out.0.weight"
+        ]
+        for part in ("q", "k"):
+            sdcpp[f"{block}.attention.{part}_norm.weight"] = state[
+                f"{block}.attention.norm_{part}.weight"
+            ]
+    try:
+        converted = {normalize_z_image_key(k): v for k, v in sdcpp.items()}
+        converted = split_fused_attention(converted)
+        sdcpp_model = build_z_image_transformer(
+            converted, detect_z_image_config(converted)
+        )
+        with torch.inference_mode():
+            sdcpp_out = sdcpp_model(latent, timestep, caption)
+        check(
+            "Z-Image: fused qkv and sd.cpp names",
+            (want - sdcpp_out).abs().max().item() < 1e-6,
+            f"{len(attentions)} attentions split",
+        )
+    except Exception as e:  # noqa: BLE001
+        check("Z-Image: fused qkv and sd.cpp names", False, str(e))
+
+    wrong = dict(reference.state_dict())
+    wrong["cap_embedder.1.weight"] = torch.zeros(detected["dim"], 48)
+    try:
+        build_z_image_transformer(wrong, detected)
+        check("Z-Image: wrong shape refused", False, "it was accepted")
+    except ModelError:
+        check("Z-Image: wrong shape refused", True)
+
+    try:
+        shared = ZImageTransformer(
+            in_channels=4,
+            dim=256,
+            n_layers=1,
+            n_refiner_layers=1,
+            n_heads=2,
+            n_kv_heads=1,
+            cap_feat_dim=24,
+        ).eval()
+        with torch.inference_mode():
+            grouped = shared(latent, timestep, caption)
+        check(
+            "Z-Image: grouped-query attention",
+            tuple(grouped.shape) == tuple(latent.shape)
+            and bool(torch.isfinite(grouped).all()),
+        )
+    except Exception as e:  # noqa: BLE001
+        check("Z-Image: grouped-query attention", False, str(e))
+
+    target = "layers.0.attention.to_q"
+    lora = {
+        f"transformer.{target}.lora_A.weight": torch.randn(8, 256) * 0.05,
+        f"transformer.{target}.lora_B.weight": torch.randn(256, 8) * 0.05,
+    }
+    applied, skipped = apply_z_image_lora(rebuilt, lora, "self_test", 1.0)
+    with torch.inference_mode():
+        changed = rebuilt(latent, timestep, caption)
+    check(
+        "Z-Image: LoRA applies",
+        applied == 1 and not skipped,
+        f"{applied} modules, {len(skipped)} unmatched",
+    )
+    check("Z-Image: LoRA changes the output", (changed - got).abs().max().item() > 1e-4)
+    clear_z_image_loras(rebuilt)
+    with torch.inference_mode():
+        restored = rebuilt(latent, timestep, caption)
+    check("Z-Image: LoRA clears", (restored - got).abs().max().item() < 1e-9)
+
+
 def self_test():
     print(describe_torch_build() + ".")
     print(f"Devices: {', '.join(available_devices())}.")
@@ -5712,6 +8253,10 @@ def self_test():
         ", ".join(sorted(set(MODEL_LICENSES) - builtin)) or "none stale",
     )
 
+    _self_test_schedulers(check)
+
+    _self_test_zimage(check)
+
     _self_test_ncnn(check)
 
     if shutil.which("ffmpeg") and shutil.which("ffprobe"):
@@ -5837,10 +8382,20 @@ class AnimusWindow(Gtk.Window):
         self.action_stack = Gtk.Stack()
         main_box.pack_start(self.action_stack, False, False, 0)
 
-        for pane in (GeneratePane(self), UpscalePane(self)):
+        for pane in (
+            GeneratePane(self),
+            ZImagePane(self),
+            ZAnimePane(self),
+            UpscalePane(self),
+        ):
             self._add_pane(pane)
 
-        self.generate, self.upscale = self.panes
+        (
+            self.generate,
+            self.zimage,
+            self.zanime,
+            self.upscale,
+        ) = self.panes
 
         self.output_notebook.set_current_page(self.console_page)
         self.mode_notebook.connect("switch-page", self.on_mode_switched)
@@ -5891,6 +8446,15 @@ class AnimusWindow(Gtk.Window):
         self.progress.set_fraction(max(0.0, min(1.0, fraction)))
         self.progress.set_text(text)
         return False
+
+    def release_other_models(self, pane):
+        released = []
+        for other in self.panes:
+            if other is pane or not hasattr(other, "release_model"):
+                continue
+            if other.release_model():
+                released.append(other.model_name)
+        return released
 
     def claim(self, pane):
         for other in self.panes:
@@ -5953,6 +8517,163 @@ class AnimusWindow(Gtk.Window):
         return False
 
 
+def _zimage_argument(arguments, name, fallback=None):
+    flag = f"--{name}"
+    for index, argument in enumerate(arguments):
+        if argument == flag and index + 1 < len(arguments):
+            return arguments[index + 1]
+        if argument.startswith(flag + "="):
+            return argument.split("=", 1)[1]
+    return fallback
+
+
+def _zimage_fetch(source, preference=GGUF_QUANT_PREFERENCE):
+    source = normalize_huggingface_url((source or "").strip())
+    if Path(source).is_file():
+        return Path(source)
+
+    if not source.lower().endswith(".gguf") and is_huggingface_repo(source):
+        resolved = resolve_gguf_in_repo(source, preference)
+        if resolved is None:
+            raise ModelError(f"No GGUF transformer found in {source}.")
+        print(f"Picked {resolved.rsplit('/', 1)[-1]} out of {source}.")
+        source = resolved
+
+    if "huggingface.co/" in source:
+        tail = source.split("huggingface.co/", 1)[1].strip("/").split("/")
+        if len(tail) >= 3:
+            from huggingface_hub import hf_hub_download
+
+            repo, filename = "/".join(tail[:2]), "/".join(tail[2:])
+            print(f"Fetching {filename} from {repo}...")
+            return Path(hf_hub_download(repo_id=repo, filename=filename))
+
+    if is_direct_url(source):
+        destination = DIT_DIR / source.rsplit("/", 1)[-1]
+        if not destination.is_file():
+            print(f"Downloading {destination.name}...")
+            download_model(
+                source,
+                destination,
+                progress=lambda done, total: print(
+                    f"  {_format_size(done)}"
+                    + (f" of {_format_size(total)}" if total else ""),
+                    end="\r",
+                ),
+            )
+            print()
+        return destination
+
+    raise ModelError(f"{source} is not a file, a URL or a Hugging Face repo.")
+
+
+def zimage_render(arguments):
+    if not VAE_AVAILABLE:
+        print("Z-Image needs diffusers for the VAE and the scheduler.")
+        return 1
+
+    dit = _zimage_argument(arguments, "dit", ZIMAGE_DEFAULT_DIT)
+    repo = _zimage_argument(arguments, "repo", ZIMAGE_COMPONENTS_REPO)
+    prompt = _zimage_argument(
+        arguments,
+        "prompt",
+        "a close-up photograph of a pair of hands holding an open book",
+    )
+    negative = _zimage_argument(arguments, "negative", "")
+    steps = int(_zimage_argument(arguments, "steps", ZIMAGE_DEFAULT_STEPS))
+    guidance = float(_zimage_argument(arguments, "guidance", ZIMAGE_DEFAULT_GUIDANCE))
+    size = int(_zimage_argument(arguments, "size", ZIMAGE_DEFAULT_SIZE))
+    width = int(_zimage_argument(arguments, "width", size))
+    height = int(_zimage_argument(arguments, "height", size))
+    seed = int(_zimage_argument(arguments, "seed", 42))
+    shift = float(_zimage_argument(arguments, "shift", ZIMAGE_DEFAULT_SHIFT))
+    output = Path(_zimage_argument(arguments, "out", "zimage.png"))
+
+    print(describe_torch_build() + ".")
+    print(
+        f"Z-Image: {width}x{height}, {steps} steps, guidance {guidance:g}, "
+        f"shift {shift:g}, seed {seed}."
+    )
+
+    from transformers import AutoModel, AutoTokenizer
+
+    local = _zimage_fetch(dit)
+    print(f"Reading the DiT from {local}...")
+    state = read_z_image_state_dict(local)
+    config = detect_z_image_config(state)
+    print(f"Detected: {config}.")
+    transformer = build_z_image_transformer(state, config, progress=print)
+    del state
+    gc.collect()
+
+    print(f"Loading the VAE, scheduler and tokenizer from {repo}...")
+    vae = AutoencoderKL.from_pretrained(
+        repo, subfolder="vae", torch_dtype=torch.float32, low_cpu_mem_usage=True
+    )
+    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+        repo, subfolder="scheduler"
+    )
+    tokenizer = AutoTokenizer.from_pretrained(repo, subfolder="tokenizer")
+
+    pipe = NativeZImagePipeline(
+        transformer=transformer,
+        vae=vae,
+        scheduler=scheduler,
+        text_encoder=None,
+        tokenizer=tokenizer,
+    )
+    pipe.scheduler = build_flow_scheduler(
+        "Euler", scheduler, shift, dynamic_shifting=False
+    )
+
+    print("Loading the Qwen3 text encoder...")
+    pipe.text_encoder = AutoModel.from_pretrained(
+        repo,
+        subfolder="text_encoder",
+        torch_dtype=ZIMAGE_TEXT_ENCODER_DTYPE,
+        low_cpu_mem_usage=True,
+    )
+    print("Encoding the prompt...")
+    with torch.inference_mode():
+        embeds, negative_embeds = pipe.encode_prompt(
+            prompt,
+            guidance > 0.0,
+            negative,
+            max_sequence_length=ZIMAGE_MAX_SEQUENCE_LENGTH,
+        )
+    print(f"Caption is {len(embeds[0])} tokens of {embeds[0].shape[-1]}.")
+    pipe.text_encoder = None
+    gc.collect()
+
+    started = time.monotonic()
+
+    def report(pipeline, index, timestep, kwargs):
+        done = index + 1
+        print(
+            f"  step {done}/{steps}  t={float(timestep):7.2f}  "
+            f"{_format_duration(time.monotonic() - started)} elapsed",
+            flush=True,
+        )
+        return kwargs
+
+    with torch.inference_mode():
+        result = pipe(
+            prompt_embeds=embeds,
+            negative_prompt_embeds=negative_embeds or None,
+            width=width,
+            height=height,
+            num_inference_steps=steps,
+            guidance_scale=guidance,
+            cfg_truncation=ZIMAGE_DEFAULT_CFG_TRUNC,
+            generator=torch.Generator(device="cpu").manual_seed(seed),
+            callback_on_step_end=report,
+        )
+
+    result.images[0].save(str(output), format="PNG")
+    print(f"Wrote {output} in {_format_duration(time.monotonic() - started)}.")
+    return 0
+
+
 def main():
     global _window
 
@@ -5965,11 +8686,19 @@ def main():
         rest = [a for a in arguments if a != "--benchmark"]
         sys.exit(benchmark(rest[0] if rest else None))
 
+    if "--zimage" in arguments:
+        sys.exit(zimage_render(arguments))
+
     if any(a in ("-h", "--help") for a in arguments):
-        print("Usage: animus [--self-test] [--benchmark] [VIDEO]")
+        print("Usage: animus [--self-test] [--benchmark] [--zimage] [VIDEO]")
         print()
         print("  --self-test   check the upscaling networks and the ffmpeg pipeline")
         print("  --benchmark   time the installed upscaling models")
+        print("  --zimage      render one image with Z-Image and exit")
+        print()
+        print("  Z-Image options: --dit --repo --prompt --negative --steps")
+        print("                   --guidance --size --width --height --seed")
+        print("                   --shift --out")
         print()
         print("A video argument opens the Upscale tab with that file loaded.")
         sys.exit(0)
