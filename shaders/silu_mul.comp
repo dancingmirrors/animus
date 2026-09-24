@@ -1,0 +1,22 @@
+#version 450
+
+// A[i] = silu(A[i]) * B[i], grid-stride so any length is one dispatch.
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint offA;
+    uint offB;
+} pc;
+
+layout(set = 0, binding = 0) buffer BufA { float A[]; };
+layout(set = 0, binding = 1) readonly buffer BufB { float B[]; };
+
+void main() {
+    uint stride = gl_NumWorkGroups.x * 256u;
+    for (uint i = gl_GlobalInvocationID.x; i < pc.n; i += stride) {
+        float a = A[pc.offA + i];
+        A[pc.offA + i] = a / (1.0 + exp(-a)) * B[pc.offB + i];
+    }
+}

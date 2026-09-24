@@ -1,0 +1,76 @@
+#version 450
+
+// In-place row softmax of scale * X, one workgroup per row; gl_WorkGroupID.y
+// is a batch, batchStride elements apart.
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Push {
+    uint rows;
+    uint cols;
+    uint ld;
+    uint off;
+    uint batchStride;
+    float scale;
+} pc;
+
+layout(set = 0, binding = 0) buffer BufX { float X[]; };
+
+shared float red[256];
+
+float reduce_max(float v) {
+    uint tid = gl_LocalInvocationID.x;
+    red[tid] = v;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (tid < s) {
+            red[tid] = max(red[tid], red[tid + s]);
+        }
+        barrier();
+    }
+    float total = red[0];
+    barrier();
+    return total;
+}
+
+float reduce_sum(float v) {
+    uint tid = gl_LocalInvocationID.x;
+    red[tid] = v;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (tid < s) {
+            red[tid] += red[tid + s];
+        }
+        barrier();
+    }
+    float total = red[0];
+    barrier();
+    return total;
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.rows) {
+        return;
+    }
+    uint tid = gl_LocalInvocationID.x;
+    uint base = pc.off + gl_WorkGroupID.y * pc.batchStride + row * pc.ld;
+
+    float m = -3.402823466e38;
+    for (uint c = tid; c < pc.cols; c += 256u) {
+        m = max(m, X[base + c] * pc.scale);
+    }
+    m = reduce_max(m);
+
+    float partial = 0.0;
+    for (uint c = tid; c < pc.cols; c += 256u) {
+        float e = exp(X[base + c] * pc.scale - m);
+        X[base + c] = e;
+        partial += e;
+    }
+    float inv = 1.0 / reduce_sum(partial);
+
+    for (uint c = tid; c < pc.cols; c += 256u) {
+        X[base + c] *= inv;
+    }
+}

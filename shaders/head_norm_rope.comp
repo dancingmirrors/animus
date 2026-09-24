@@ -1,0 +1,76 @@
+#version 450
+
+// Per (token, head), in place: RMSNorm over head_dim with W, then RoPE on
+// (even, odd) pairs from the token's cos/sin row. One thread per pair.
+
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform Push {
+    uint tokens;
+    uint heads;
+    uint head_dim;
+    uint ld;
+    uint off;
+    uint offW;
+    uint offCos;
+    uint offSin;
+    uint ldRope;
+    uint flags;
+    float eps;
+} pc;
+
+#define FLAG_NORM 1u
+#define FLAG_ROPE 2u
+
+layout(set = 0, binding = 0) buffer BufX { float X[]; };
+layout(set = 0, binding = 1) readonly buffer BufW { float W[]; };
+layout(set = 0, binding = 2) readonly buffer BufCos { float Cos[]; };
+layout(set = 0, binding = 3) readonly buffer BufSin { float Sin[]; };
+
+shared float red[64];
+
+void main() {
+    uint token = gl_WorkGroupID.x;
+    uint head = gl_WorkGroupID.y;
+    if (token >= pc.tokens || head >= pc.heads) {
+        return;
+    }
+    uint tid = gl_LocalInvocationID.x;
+    uint base = pc.off + token * pc.ld + head * pc.head_dim;
+    uint pairs = pc.head_dim / 2u;
+
+    if ((pc.flags & FLAG_NORM) != 0u) {
+        float partial = 0.0;
+        for (uint p = tid; p < pairs; p += 64u) {
+            float a = X[base + 2u * p];
+            float b = X[base + 2u * p + 1u];
+            partial += a * a + b * b;
+        }
+        red[tid] = partial;
+        barrier();
+        for (uint s = 32u; s > 0u; s >>= 1) {
+            if (tid < s) {
+                red[tid] += red[tid + s];
+            }
+            barrier();
+        }
+        float inv = inversesqrt(red[0] / float(pc.head_dim) + pc.eps);
+        for (uint p = tid; p < pairs; p += 64u) {
+            X[base + 2u * p] *= inv * W[pc.offW + 2u * p];
+            X[base + 2u * p + 1u] *= inv * W[pc.offW + 2u * p + 1u];
+        }
+        barrier();
+    }
+
+    if ((pc.flags & FLAG_ROPE) != 0u) {
+        uint rb = token * pc.ldRope;
+        for (uint p = tid; p < pairs; p += 64u) {
+            float c = Cos[pc.offCos + rb + p];
+            float s = Sin[pc.offSin + rb + p];
+            float even = X[base + 2u * p];
+            float odd = X[base + 2u * p + 1u];
+            X[base + 2u * p] = even * c - odd * s;
+            X[base + 2u * p + 1u] = even * s + odd * c;
+        }
+    }
+}

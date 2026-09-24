@@ -1,0 +1,140 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+
+// C[M, N] = alpha * A[M, K] @ B (+ bias[N]) (+= C with FLAG_ACCUMULATE).
+// A: float32, row stride lda. B: B_F16 or B_F32; B_NK is [N, K] (a linear
+// weight), B_KN is [K, N]. C: float32, row stride ldc. gl_WorkGroupID.z is a
+// batch; batchA/B/C are element strides, so a head's slice addresses in place.
+// Shared-memory tiling: BM x BN per workgroup, TM x TN per thread, BK per step.
+
+#ifdef SMALL
+#define BM 32
+#define BN 32
+#define BK 16
+#define TM 4
+#define TN 4
+#else
+#define BM 128
+#define BN 128
+#define BK 16
+#define TM 8
+#define TN 8
+#endif
+
+#define TX (BN / TN)
+#define TY (BM / TM)
+#define THREADS (TX * TY)
+
+layout(local_size_x = THREADS) in;
+
+layout(push_constant) uniform Push {
+    uint M, N, K;
+    uint lda, ldb, ldc;
+    uint offA, offB, offC;
+    uint batchA, batchB, batchC;
+    uint flags;
+    uint offBias;
+    float alpha;
+} pc;
+
+#define FLAG_ACCUMULATE 1u
+#define FLAG_BIAS 2u
+
+layout(set = 0, binding = 0) readonly buffer BufA { float A[]; };
+#ifdef B_F16
+layout(set = 0, binding = 1) readonly buffer BufB { float16_t B[]; };
+#define LOADB(i) float(B[i])
+#else
+layout(set = 0, binding = 1) readonly buffer BufB { float B[]; };
+#define LOADB(i) B[i]
+#endif
+layout(set = 0, binding = 2) buffer BufC { float C[]; };
+layout(set = 0, binding = 3) readonly buffer BufBias { float bias[]; };
+
+// Padded by one so the transposed stores spread across banks.
+shared float As[BK][BM + 1];
+shared float Bs[BK][BN + 1];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint tx = tid % TX;
+    uint ty = tid / TX;
+    uint m0 = gl_WorkGroupID.x * BM;
+    uint n0 = gl_WorkGroupID.y * BN;
+    uint batch = gl_WorkGroupID.z;
+    uint baseA = pc.offA + batch * pc.batchA;
+    uint baseB = pc.offB + batch * pc.batchB;
+    uint baseC = pc.offC + batch * pc.batchC;
+
+    float acc[TM][TN];
+    for (uint i = 0u; i < TM; i++) {
+        for (uint j = 0u; j < TN; j++) {
+            acc[i][j] = 0.0;
+        }
+    }
+
+    for (uint k0 = 0u; k0 < pc.K; k0 += BK) {
+        for (uint i = tid; i < BM * BK; i += THREADS) {
+            uint r = i / BK;
+            uint c = i % BK;
+            uint gr = m0 + r;
+            uint gc = k0 + c;
+            As[c][r] = (gr < pc.M && gc < pc.K) ? A[baseA + gr * pc.lda + gc] : 0.0;
+        }
+        for (uint i = tid; i < BK * BN; i += THREADS) {
+#ifdef B_KN
+            uint r = i / BN;
+            uint c = i % BN;
+            uint gk = k0 + r;
+            uint gn = n0 + c;
+            Bs[r][c] = (gk < pc.K && gn < pc.N) ? LOADB(baseB + gk * pc.ldb + gn) : 0.0;
+#else
+            uint c = i / BK;
+            uint r = i % BK;
+            uint gk = k0 + r;
+            uint gn = n0 + c;
+            Bs[r][c] = (gk < pc.K && gn < pc.N) ? LOADB(baseB + gn * pc.ldb + gk) : 0.0;
+#endif
+        }
+        barrier();
+        for (uint kk = 0u; kk < BK; kk++) {
+            float a[TM];
+            float b[TN];
+            for (uint i = 0u; i < TM; i++) {
+                a[i] = As[kk][ty * TM + i];
+            }
+            for (uint j = 0u; j < TN; j++) {
+                b[j] = Bs[kk][tx * TN + j];
+            }
+            for (uint i = 0u; i < TM; i++) {
+                for (uint j = 0u; j < TN; j++) {
+                    acc[i][j] += a[i] * b[j];
+                }
+            }
+        }
+        barrier();
+    }
+
+    for (uint i = 0u; i < TM; i++) {
+        uint gr = m0 + ty * TM + i;
+        if (gr >= pc.M) {
+            continue;
+        }
+        for (uint j = 0u; j < TN; j++) {
+            uint gc = n0 + tx * TN + j;
+            if (gc >= pc.N) {
+                continue;
+            }
+            float v = pc.alpha * acc[i][j];
+            if ((pc.flags & FLAG_BIAS) != 0u) {
+                v += bias[pc.offBias + gc];
+            }
+            uint idx = baseC + gr * pc.ldc + gc;
+            if ((pc.flags & FLAG_ACCUMULATE) != 0u) {
+                C[idx] += v;
+            } else {
+                C[idx] = v;
+            }
+        }
+    }
+}

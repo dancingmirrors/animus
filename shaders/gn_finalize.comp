@@ -1,0 +1,29 @@
+#version 450
+
+// Reduces the per-block partials: pass 0 writes the mean per group, pass 1
+// the reciprocal standard deviation. One workgroup.
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Push {
+    uint n_blocks, G;
+    uint count;
+    uint pass_;
+    uint offIn, offOut;
+    float eps;
+} pc;
+
+layout(set = 0, binding = 0) readonly buffer BufIn { float In[]; };
+layout(set = 0, binding = 1) writeonly buffer BufOut { float Out[]; };
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    for (uint g = tid; g < pc.G; g += 256u) {
+        float s = 0.0;
+        for (uint b = 0u; b < pc.n_blocks; b++) {
+            s += In[pc.offIn + b * pc.G + g];
+        }
+        float v = s / float(pc.count);
+        Out[pc.offOut + g] = (pc.pass_ != 0u) ? inversesqrt(v + pc.eps) : v;
+    }
+}

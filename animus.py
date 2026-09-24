@@ -119,6 +119,8 @@ from PIL.PngImagePlugin import PngInfo
 
 _PILImage.preinit()
 
+import animus_vulkan
+
 # isort: on
 # autopep8: on
 
@@ -554,6 +556,7 @@ ZIMAGE_TOKEN_LIMIT = ZIMAGE_MAX_SEQUENCE_LENGTH
 ZIMAGE_SIZE_MULTIPLE = 16
 ZIMAGE_SAMPLERS = FLOW_SAMPLERS
 ZIMAGE_TEXT_ENCODER_DTYPE = torch.bfloat16
+ZIMAGE_CPU_DEVICE = "cpu"
 
 
 def cast_floats(value, dtype):
@@ -2680,13 +2683,13 @@ def describe_torch_build():
     return ", ".join(parts)
 
 
-Z_SEQ_MULTIPLE = 32
-Z_ADALN_EMBED_DIM = 256
-Z_FREQUENCY_EMBEDDING_SIZE = 256
-Z_MAX_PERIOD = 10000
-Z_ROPE_THETA = 256.0
-Z_ROPE_AXES_DIMS = (32, 48, 48)
-Z_ROPE_AXES_LENS = (1536, 512, 512)
+Z_SEQ_MULTIPLE = animus_vulkan.Z_SEQ_MULTIPLE
+Z_ADALN_EMBED_DIM = animus_vulkan.Z_ADALN_EMBED_DIM
+Z_FREQUENCY_EMBEDDING_SIZE = animus_vulkan.Z_FREQUENCY_EMBEDDING_SIZE
+Z_MAX_PERIOD = animus_vulkan.Z_MAX_PERIOD
+Z_ROPE_THETA = animus_vulkan.Z_ROPE_THETA
+Z_ROPE_AXES_DIMS = animus_vulkan.Z_ROPE_AXES_DIMS
+Z_ROPE_AXES_LENS = animus_vulkan.Z_ROPE_AXES_LENS
 
 
 class ZRMSNorm(nn.Module):
@@ -3063,28 +3066,7 @@ class ZImageTransformer(nn.Module):
         return self._unpatchify(unified, grid)
 
 
-Z_STRIP_PREFIXES = ("model.diffusion_model.", "diffusion_model.", "model.", "net.")
-
-Z_NAME_ALIASES = (
-    ("x_embedder.", "all_x_embedder.2-1."),
-    ("final_layer.", "all_final_layer.2-1."),
-    (".attention.q_norm.", ".attention.norm_q."),
-    (".attention.k_norm.", ".attention.norm_k."),
-    (".attention.out.", ".attention.to_out.0."),
-)
-
-
-def normalize_z_image_key(name):
-    for prefix in Z_STRIP_PREFIXES:
-        if name.startswith(prefix):
-            name = name[len(prefix) :]
-            break
-    for source, target in Z_NAME_ALIASES:
-        if source.startswith("."):
-            name = name.replace(source, target)
-        elif name.startswith(source):
-            name = target + name[len(source) :]
-    return name
+normalize_z_image_key = animus_vulkan.normalize_key
 
 
 class ZQuantLinear(nn.Linear):
@@ -3093,17 +3075,18 @@ class ZQuantLinear(nn.Linear):
         self.compute_dtype = torch.float32
         self.loras = {}
 
-    def add_lora(self, adapter, down, up, scale=1.0):
+    def add_lora(self, adapter, down, up, scale=1.0, factor=1.0):
         self.loras[adapter] = (
             down.to(self.compute_dtype),
             up.to(self.compute_dtype),
-            float(scale),
+            float(scale) * float(factor),
+            float(factor),
         )
 
     def set_lora_scale(self, adapter, scale):
         if adapter in self.loras:
-            down, up, _ = self.loras[adapter]
-            self.loras[adapter] = (down, up, float(scale))
+            down, up, _, factor = self.loras[adapter]
+            self.loras[adapter] = (down, up, float(scale) * factor, factor)
 
     def clear_loras(self):
         self.loras = {}
@@ -3121,7 +3104,7 @@ class ZQuantLinear(nn.Linear):
         inputs = inputs.to(self.compute_dtype)
         bias = None if self.bias is None else self.bias.to(self.compute_dtype)
         output = F.linear(inputs, self._weight(), bias)
-        for down, up, scale in self.loras.values():
+        for down, up, scale, _factor in self.loras.values():
             if scale:
                 output = output + scale * F.linear(F.linear(inputs, down), up)
         return output
@@ -3224,67 +3207,19 @@ def detect_z_image_config(state):
         tensor = state.get(key)
         return None if tensor is None else _logical_shape(tensor)
 
-    x_embed = shape_of("all_x_embedder.2-1.weight")
-    if x_embed is None:
-        raise ModelError(
-            "This file has no all_x_embedder.2-1.weight, so it is not a "
-            "Z-Image diffusion transformer."
-        )
-    dim, patch_features = int(x_embed[0]), int(x_embed[1])
+    try:
+        config = animus_vulkan.detect_config(state, shape_of)
+    except animus_vulkan.VulkanError as e:
+        raise ModelError(str(e)) from e
 
-    patch_size, f_patch_size = 2, 1
-    in_channels = patch_features // (patch_size * patch_size * f_patch_size)
-
-    cap = shape_of("cap_embedder.1.weight")
-    cap_feat_dim = int(cap[1]) if cap else 2560
-
-    def count(prefix):
-        best = -1
-        for name in state:
-            if not name.startswith(prefix):
-                continue
-            piece = name[len(prefix) :].split(".", 1)[0]
-            if piece.isdigit():
-                best = max(best, int(piece))
-        return best + 1
-
-    n_layers = count("layers.") or 30
-    n_refiner_layers = max(count("noise_refiner."), count("context_refiner.")) or 2
-
-    q_norm = shape_of("layers.0.attention.norm_q.weight")
-    if q_norm:
-        head_dim = int(q_norm[0])
-        n_heads = dim // head_dim
-    else:
-        head_dim, n_heads = 128, dim // 128
-    to_k = shape_of("layers.0.attention.to_k.weight")
-    n_kv_heads = int(to_k[0]) // head_dim if to_k else n_heads
-
-    w1 = shape_of("layers.0.feed_forward.w1.weight")
-    ffn_hidden = int(w1[0]) if w1 else None
-    t_mid = shape_of("t_embedder.mlp.0.weight")
-    t_embedder_mid = int(t_mid[0]) if t_mid else 1024
-
+    head_dim = config.pop("head_dim")
     if head_dim != sum(Z_ROPE_AXES_DIMS):
         raise ModelError(
             f"This checkpoint has a head dimension of {head_dim}, but "
             f"Z-Image's rotary embedding is built for "
             f"{sum(Z_ROPE_AXES_DIMS)}. This is not a Z-Image DiT."
         )
-
-    return dict(
-        in_channels=in_channels,
-        dim=dim,
-        n_layers=n_layers,
-        n_refiner_layers=n_refiner_layers,
-        n_heads=n_heads,
-        n_kv_heads=n_kv_heads,
-        cap_feat_dim=cap_feat_dim,
-        patch_size=patch_size,
-        f_patch_size=f_patch_size,
-        ffn_hidden=ffn_hidden,
-        t_embedder_mid=t_embedder_mid,
-    )
+    return config
 
 
 def build_z_image_transformer(state, config=None, progress=None):
@@ -3641,10 +3576,20 @@ def _lora_target(key, suffix, known):
     return None
 
 
+def is_vulkan_transformer(model):
+    return isinstance(model, animus_vulkan.VulkanZImage)
+
+
 def apply_z_image_lora(model, state_dict, adapter="lora", scale=1.0):
-    known = {
-        name for name, module in model.named_modules() if isinstance(module, nn.Linear)
-    }
+    on_vulkan = is_vulkan_transformer(model)
+    if on_vulkan:
+        known = set(model.lora_targets)
+    else:
+        known = {
+            name
+            for name, module in model.named_modules()
+            if isinstance(module, nn.Linear)
+        }
     pairs = {}
     for key in state_dict:
         for suffix in Z_LORA_DOWN_SUFFIXES:
@@ -3673,9 +3618,18 @@ def apply_z_image_lora(model, state_dict, adapter="lora", scale=1.0):
         rank = down.shape[0]
         alpha_key = parts["down"].rsplit(".lora", 1)[0] + ".alpha"
         alpha = state_dict.get(alpha_key)
-        effective = float(scale)
+        factor = 1.0
         if alpha is not None and rank:
-            effective *= float(alpha.item()) / rank
+            factor = float(alpha.item()) / rank
+
+        if on_vulkan:
+            wanted = model.lora_shape(matched)
+            if wanted is None or (up.shape[0], down.shape[1]) != wanted:
+                skipped.append(target)
+                continue
+            model.add_lora(matched, adapter, down.numpy(), up.numpy(), scale, factor)
+            applied += 1
+            continue
 
         module = promote_to_quant_linear(model, matched)
         if module is None:
@@ -3684,28 +3638,61 @@ def apply_z_image_lora(model, state_dict, adapter="lora", scale=1.0):
         if down.shape[1] != module.in_features or up.shape[0] != module.out_features:
             skipped.append(target)
             continue
-        module.add_lora(adapter, down, up, effective)
+        module.add_lora(adapter, down, up, scale, factor)
         applied += 1
 
     return applied, skipped
 
 
 def set_z_image_lora_scale(model, adapter, scale):
+    if is_vulkan_transformer(model):
+        model.set_lora_scale(adapter, scale)
+        return
     for module in model.modules():
         if isinstance(module, ZQuantLinear):
             module.set_lora_scale(adapter, scale)
 
 
 def clear_z_image_loras(model):
+    if is_vulkan_transformer(model):
+        model.clear_loras()
+        return
     for module in model.modules():
         if isinstance(module, ZQuantLinear):
             module.clear_loras()
 
 
+def release_transformer(pipe):
+    drop_transformer(getattr(pipe, "transformer", None))
+    vae = getattr(pipe, "vae", None)
+    if isinstance(vae, animus_vulkan.VulkanVAE):
+        vae.release()
+
+
+def drop_transformer(transformer):
+    if is_vulkan_transformer(transformer):
+        transformer.release()
+
+
+def zimage_devices():
+    try:
+        return animus_vulkan.vulkan_devices()
+    except Exception as e:  # noqa: BLE001
+        print(f"Could not list the Vulkan devices: {e}.")
+        return []
+
+
+def zimage_default_device():
+    try:
+        return animus_vulkan.preferred_vulkan_device() or ZIMAGE_CPU_DEVICE
+    except Exception:  # noqa: BLE001
+        return ZIMAGE_CPU_DEVICE
+
+
 class GeneratePane:
     name = "generate"
     mode_label = "Generate"
-    output_label = "Generated Image"
+    output_label = "Generated Image (Anima)"
 
     model_name = "Anima"
     model_label = "DiT (GGUF):"
@@ -4469,12 +4456,19 @@ class GeneratePane:
             raise ModelError(f"No {self.model_name} DiT specified.")
         return model_name
 
+    def _discard_pipe(self):
+        pipe = self.pipe
+        self.pipe = None
+        if pipe is not None:
+            release_transformer(pipe)
+            del pipe
+        gc.collect()
+
     def _check_stop_loading(self, cleanup_pipe=False):
         if self.stop_event.is_set():
             update_status("Interrupted by user.")
             if cleanup_pipe and self.pipe is not None:
-                self.pipe = None
-                gc.collect()
+                self._discard_pipe()
             return True
         return False
 
@@ -4489,8 +4483,7 @@ class GeneratePane:
                 if self._check_stop_loading():
                     return
                 update_status("Cleaning up existing model...")
-                del self.pipe
-                self.pipe = None
+                self._discard_pipe()
                 self._base_scheduler = None
                 self._loaded_adapters = {}
                 self._prompt_cache = None
@@ -4519,9 +4512,7 @@ class GeneratePane:
 
         except KeyboardInterrupt:
             update_status("Interrupted by user.")
-            if self.pipe is not None:
-                self.pipe = None
-                gc.collect()
+            self._discard_pipe()
             GLib.idle_add(self._enable_load)
         except Exception as e:  # noqa: BLE001
             if self.stop_event.is_set():
@@ -4816,7 +4807,7 @@ class GeneratePane:
     def release_model(self):
         if self.pipe is None or self.busy:
             return False
-        self.pipe = None
+        self._discard_pipe()
         self._base_scheduler = None
         self._loaded_adapters = {}
         self._prompt_cache = None
@@ -5867,36 +5858,90 @@ class NativeZImagePane(DiffusersPane):
             raise ModelError(f"{source} has no transformer/*.safetensors.")
         return shards
 
-    def _load_transformer(self, dit_source):
+    def _selected_device(self):
+        combo = getattr(self, "device_combo", None)
+        chosen = combo.get_active_id() if combo is not None else None
+        return chosen or ZIMAGE_CPU_DEVICE
+
+    def _dit_files(self, dit_source):
         if dit_source.startswith(UNQUANTIZED_PREFIX):
             repo = dit_source[len(UNQUANTIZED_PREFIX) :] or self.components_repo
-            state = {}
-            for shard in self._unquantized_files(repo):
-                state.update(read_z_image_state_dict(shard))
-        else:
-            local = self._fetch_dit(dit_source)
-            if local.suffix.lower() == ".gguf":
-                try:
-                    import gguf  # noqa: F401
-                except Exception as e:
-                    raise ModelError(
-                        f"{local.name} is a GGUF file, which needs the gguf "
-                        f"package to unpack ({e})."
-                    ) from e
-            update_status(f"Reading the {self.model_name} DiT from {local.name}...")
-            state = read_z_image_state_dict(local)
+            return self._unquantized_files(repo)
+        local = self._fetch_dit(dit_source)
+        if local.suffix.lower() == ".gguf":
+            try:
+                import gguf  # noqa: F401
+            except Exception as e:
+                raise ModelError(
+                    f"{local.name} is a GGUF file, which needs the gguf "
+                    f"package to unpack ({e})."
+                ) from e
+        return [local]
 
-        if self._check_stop_loading():
-            return None
-
-        config = detect_z_image_config(state)
+    @staticmethod
+    def _describe_config(config):
         update_status(
             f"{config['n_layers']} layers of {config['dim']} across "
             f"{config['n_heads']} heads, {config['n_refiner_layers']} refiner "
             f"layers, caption features {config['cap_feat_dim']} wide."
         )
+
+    def _load_transformer(self, dit_source):
+        files = self._dit_files(dit_source)
+        device = self._selected_device()
+        if device != ZIMAGE_CPU_DEVICE:
+            return self._load_vulkan_transformer(files, device)
+
+        state = {}
+        for path in files:
+            update_status(f"Reading the {self.model_name} DiT from {path.name}...")
+            state.update(read_z_image_state_dict(path))
+
+        if self._check_stop_loading():
+            return None
+
+        config = detect_z_image_config(state)
+        self._describe_config(config)
         with report_loader_complaints():
             return build_z_image_transformer(state, config, progress=update_status)
+
+    def _load_vulkan_transformer(self, files, device):
+        try:
+            gpu = animus_vulkan.get_device(device)
+        except (animus_vulkan.VulkanUnavailable, animus_vulkan.VulkanError) as e:
+            raise ModelError(f"Could not open {device}: {e}") from e
+        update_status(f"Using {gpu.describe()}.")
+
+        names = ", ".join(path.name for path in files)
+        update_status(f"Reading the {self.model_name} DiT from {names}...")
+        tensors = animus_vulkan.read_checkpoints(files)
+        config = animus_vulkan.detect_config(tensors)
+        self._describe_config(config)
+
+        weights = sum(t.nbytes for t in tensors.values() if len(t.shape) > 1)
+        free, total = gpu.budget()
+        if weights > free * 0.85:
+            update_status(
+                f"The weights are {_format_size(weights)} and {gpu.name} has "
+                f"about {_format_size(free)} free of {_format_size(total)}. "
+                "Whatever does not fit stays in host memory and is read over "
+                "the bus, which is slower. A smaller quantization would fit "
+                "outright."
+            )
+
+        if self._check_stop_loading():
+            return None
+
+        try:
+            return animus_vulkan.VulkanZImage(
+                gpu,
+                tensors,
+                config,
+                progress=update_status,
+                stop_check=lambda: self.stop_event.is_set(),
+            )
+        except animus_vulkan.VulkanError as e:
+            raise ModelError(str(e)) from e
 
     def _check_transformer_weights(self, transformer):
         return
@@ -5909,6 +5954,7 @@ class NativeZImagePane(DiffusersPane):
         repo = self.components_repo
         transformer = self._load_transformer(dit_source)
         if transformer is None or self._check_stop_loading():
+            drop_transformer(transformer)
             del transformer
             gc.collect()
             return None
@@ -5932,6 +5978,7 @@ class NativeZImagePane(DiffusersPane):
         )
 
         if self._check_stop_loading():
+            drop_transformer(transformer)
             del transformer, vae
             gc.collect()
             return None
@@ -5953,6 +6000,14 @@ class NativeZImagePane(DiffusersPane):
                     getattr(vae, enable)()
             except Exception as e:  # noqa: BLE001
                 print(f"Warning: could not turn on VAE {name}: {e}.")
+
+        if is_vulkan_transformer(transformer):
+            try:
+                pipe.vae = animus_vulkan.VulkanVAE(
+                    transformer.device, vae, progress=update_status, fallback=vae
+                )
+            except animus_vulkan.VulkanError as e:
+                update_status(f"The VAE decode stays on the CPU: {e}")
 
         self._align_prompt_dtype(pipe)
 
@@ -6124,6 +6179,49 @@ class NativeZImagePane(DiffusersPane):
                 continue
             _, weight_spin = self.lora_weight_entries[slot]
             set_z_image_lora_scale(transformer, adapter, spin_value(weight_spin))
+
+    def _extra_controls(self, controls_box):
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        label = Gtk.Label(label="Device:")
+        label.set_size_request(100, -1)
+        label.set_xalign(0)
+        box.pack_start(label, False, False, 0)
+
+        self.device_combo = Gtk.ComboBoxText()
+        self.device_combo.append(ZIMAGE_CPU_DEVICE, "CPU via torch")
+        for ident, description, _kind in zimage_devices():
+            self.device_combo.append(ident, description)
+        self.device_combo.set_active_id(zimage_default_device())
+        box.pack_start(self.device_combo, True, True, 0)
+        controls_box.pack_start(box, False, False, 0)
+
+        super()._extra_controls(controls_box)
+
+    def _extra_metadata(self):
+        metadata = super()._extra_metadata()
+        metadata["device"] = self._selected_device()
+        return metadata
+
+    def collect_settings(self):
+        settings = super().collect_settings()
+        settings["device"] = self._selected_device()
+        return settings
+
+    def load_settings(self, settings):
+        super().load_settings(settings)
+        wanted = settings.get("device")
+        if not isinstance(wanted, str) or not wanted:
+            return
+        if not self.device_combo.set_active_id(wanted):
+            self.device_combo.set_active_id(zimage_default_device())
+            update_status(
+                f"The saved {self.model_name} device {wanted} is not here, so "
+                f"the DiT will run on {self._selected_device()}."
+            )
+
+    def on_restore_defaults_clicked(self, button):
+        self.device_combo.set_active_id(zimage_default_device())
+        super().on_restore_defaults_clicked(button)
 
 
 class ZImagePane(NativeZImagePane):
@@ -8037,6 +8135,169 @@ def _self_test_zimage(check):
     check("Z-Image: LoRA clears", (restored - got).abs().max().item() < 1e-9)
 
 
+def _self_test_vulkan(check):
+    stale = animus_vulkan.stale_shaders()
+    check(
+        "Vulkan: shipped SPIR-V matches the GLSL",
+        not stale,
+        f"{len(stale)} stale, starting with {stale[0]}" if stale else "all current",
+    )
+    if not animus_vulkan.vulkan_devices():
+        print("note  no Vulkan device, so the GPU backend was not tested")
+        return
+
+    device = animus_vulkan.self_test(check)
+    if device is None:
+        return
+
+    torch.manual_seed(0)
+    caption = torch.randn(13, 24)
+    latent = torch.randn(4, 1, 12, 20)
+    timestep = torch.tensor([0.42])
+    base = dict(
+        in_channels=4,
+        dim=256,
+        n_layers=2,
+        n_refiner_layers=1,
+        n_heads=2,
+        n_kv_heads=2,
+        cap_feat_dim=24,
+    )
+    grouped = dict(base, n_layers=1, n_kv_heads=1)
+
+    for label, shape, quantize, tolerance in (
+        ("float16", base, None, 1e-3),
+        ("Q8_0", base, "Q8_0", 5e-3),
+        ("grouped-query", grouped, None, 1e-3),
+    ):
+        stage = f"Vulkan: DiT with {label} weights matches torch"
+        model = None
+        try:
+            torch.manual_seed(0)
+            reference = ZImageTransformer(**shape).eval()
+            with torch.no_grad():
+                for name, parameter in reference.named_parameters():
+                    if parameter.dim() == 1 and "bias" not in name:
+                        parameter.add_(torch.randn_like(parameter) * 0.1)
+            arrays = {
+                name: tensor.detach().to(torch.float32).numpy()
+                for name, tensor in reference.state_dict().items()
+            }
+            tensors = animus_vulkan.tensors_from_arrays(arrays, quantize)
+            rounded = {
+                name: torch.from_numpy(tensor.float32().copy())
+                for name, tensor in tensors.items()
+            }
+            expected = build_z_image_transformer(
+                rounded, detect_z_image_config(rounded)
+            )
+            with torch.inference_mode():
+                want = expected(latent, timestep, caption)
+            model = animus_vulkan.VulkanZImage(device, tensors)
+            got = model(latent, timestep, caption)
+            error = (got - want).abs().max().item() / max(1.0, want.abs().max().item())
+            check(
+                stage,
+                tuple(got.shape) == tuple(want.shape) and error < tolerance,
+                f"max relative error {error:.2e}",
+            )
+            if quantize is None and shape is base:
+                stage = "Vulkan: LoRA with alpha matches torch"
+                down = torch.randn(8, 256) * 0.05
+                up = torch.randn(256, 8) * 0.05
+                lora = {
+                    "transformer.layers.0.attention.to_q.lora_A.weight": down,
+                    "transformer.layers.0.attention.to_q.lora_B.weight": up,
+                    "transformer.layers.0.attention.to_q.alpha": torch.tensor(4.0),
+                }
+                apply_z_image_lora(expected, lora, "self_test", 0.7)
+                set_z_image_lora_scale(expected, "self_test", 0.9)
+                applied, skipped = apply_z_image_lora(model, lora, "self_test", 0.7)
+                set_z_image_lora_scale(model, "self_test", 0.9)
+                with torch.inference_mode():
+                    want_lora = expected(latent, timestep, caption)
+                got_lora = model(latent, timestep, caption)
+                error = (got_lora - want_lora).abs().max().item() / max(
+                    1.0, want_lora.abs().max().item()
+                )
+                moved = (got_lora - got).abs().max().item()
+                check(
+                    stage,
+                    applied == 1 and not skipped and error < tolerance and moved > 1e-4,
+                    f"{applied} applied, max relative error {error:.2e}",
+                )
+                clear_z_image_loras(model)
+        except Exception as e:  # noqa: BLE001
+            traceback.print_exc()
+            check(stage, False, str(e))
+        finally:
+            if model is not None:
+                model.release()
+
+    _self_test_vulkan_vae(check, device)
+
+
+def _self_test_vulkan_vae(check, device):
+    if not VAE_AVAILABLE:
+        return
+    stage = "Vulkan: VAE decode matches diffusers"
+    gpu_vae = None
+    try:
+        torch.manual_seed(0)
+        vae = AutoencoderKL(
+            in_channels=3,
+            out_channels=3,
+            down_block_types=("DownEncoderBlock2D",) * 4,
+            up_block_types=("UpDecoderBlock2D",) * 4,
+            block_out_channels=(32, 64, 64, 64),
+            layers_per_block=2,
+            latent_channels=4,
+            norm_num_groups=32,
+            mid_block_add_attention=True,
+            use_quant_conv=False,
+            use_post_quant_conv=False,
+        ).eval()
+        with torch.no_grad():
+            for _name, parameter in vae.named_parameters():
+                if parameter.dim() == 1:
+                    parameter.add_(torch.randn_like(parameter) * 0.2)
+                else:
+                    parameter.copy_(parameter.to(torch.float16).float())
+        gpu_vae = animus_vulkan.VulkanVAE(device, vae)
+        latent = torch.randn(1, 4, 6, 10)
+        with torch.inference_mode():
+            want = vae.decode(latent, return_dict=False)[0]
+        got = gpu_vae.decode(latent, return_dict=False)[0]
+        error = (got - want).abs().max().item() / max(1.0, want.abs().max().item())
+        check(
+            stage,
+            tuple(got.shape) == tuple(want.shape) and error < 1e-3,
+            f"max relative error {error:.2e}",
+        )
+
+        stage = "Vulkan: tiled VAE decode matches diffusers"
+        vae.tile_latent_min_size, vae.tile_sample_min_size = 8, 64
+        vae.enable_tiling()
+        gpu_vae.tile_latent_min_size = 8
+        gpu_vae.enable_tiling()
+        latent = torch.randn(1, 4, 12, 20)
+        with torch.inference_mode():
+            want = vae.decode(latent, return_dict=False)[0]
+        got = gpu_vae.decode(latent, return_dict=False)[0]
+        error = (got - want).abs().max().item() / max(1.0, want.abs().max().item())
+        check(
+            stage,
+            tuple(got.shape) == tuple(want.shape) and error < 1e-3,
+            f"max relative error {error:.2e}",
+        )
+    except Exception as e:  # noqa: BLE001
+        traceback.print_exc()
+        check(stage, False, str(e))
+    finally:
+        if gpu_vae is not None:
+            gpu_vae.release()
+
+
 def self_test():
     print(describe_torch_build() + ".")
     print(f"Devices: {', '.join(available_devices())}.")
@@ -8208,6 +8469,8 @@ def self_test():
 
     _self_test_zimage(check)
 
+    _self_test_vulkan(check)
+
     _self_test_ncnn(check)
 
     if shutil.which("ffmpeg") and shutil.which("ffprobe"):
@@ -8215,7 +8478,7 @@ def self_test():
     else:
         print(
             "note  ffmpeg and ffprobe are not in the PATH, so the video pipeline "
-            "was not exercised"
+            "was not tested"
         )
 
     print()
@@ -8432,7 +8695,8 @@ class AnimusWindow(Gtk.Window):
         return False
 
     def save_settings(self):
-        settings = dict(self._settings)
+        known = {pane.name for pane in self.panes}
+        settings = {k: v for k, v in self._settings.items() if k in known}
         settings["mode"] = self.current_pane().name
 
         for pane in self.panes:
@@ -8458,6 +8722,11 @@ class AnimusWindow(Gtk.Window):
 
         for pane in self.panes:
             pane.shutdown()
+
+        for pane in self.panes:
+            release = getattr(pane, "release_model", None)
+            if release is not None and not pane.busy:
+                release()
 
         return False
 
@@ -8533,6 +8802,9 @@ def zimage_render(arguments):
     seed = int(_zimage_argument(arguments, "seed", 42))
     shift = float(_zimage_argument(arguments, "shift", ZIMAGE_DEFAULT_SHIFT))
     output = Path(_zimage_argument(arguments, "out", "zimage.png"))
+    device = _zimage_argument(arguments, "device", "auto").strip().lower()
+    if device == "auto":
+        device = zimage_default_device()
 
     print(describe_torch_build() + ".")
     print(
@@ -8544,11 +8816,24 @@ def zimage_render(arguments):
 
     local = _zimage_fetch(dit)
     print(f"Reading the DiT from {local}...")
-    state = read_z_image_state_dict(local)
-    config = detect_z_image_config(state)
-    print(f"Detected: {config}.")
-    transformer = build_z_image_transformer(state, config, progress=print)
-    del state
+    if device != ZIMAGE_CPU_DEVICE:
+        try:
+            gpu = animus_vulkan.get_device(device)
+        except (animus_vulkan.VulkanUnavailable, animus_vulkan.VulkanError) as e:
+            print(f"Could not open {device}: {e} Try --device cpu.")
+            return 1
+        print(f"Using {gpu.describe()}.")
+        tensors = animus_vulkan.read_checkpoints([local])
+        config = animus_vulkan.detect_config(tensors)
+        print(f"Detected: {config}.")
+        transformer = animus_vulkan.VulkanZImage(gpu, tensors, config, progress=print)
+        del tensors
+    else:
+        state = read_z_image_state_dict(local)
+        config = detect_z_image_config(state)
+        print(f"Detected: {config}.")
+        transformer = build_z_image_transformer(state, config, progress=print)
+        del state
     gc.collect()
 
     print(f"Loading the VAE, scheduler and tokenizer from {repo}...")
@@ -8570,6 +8855,8 @@ def zimage_render(arguments):
     pipe.scheduler = build_flow_scheduler(
         "Euler", scheduler, shift, dynamic_shifting=False
     )
+    if device != ZIMAGE_CPU_DEVICE:
+        pipe.vae = animus_vulkan.VulkanVAE(gpu, vae, progress=print, fallback=vae)
 
     print("Loading the Qwen3 text encoder...")
     pipe.text_encoder = AutoModel.from_pretrained(
@@ -8643,7 +8930,7 @@ def main():
         print()
         print("  Z-Image options: --dit --repo --prompt --negative --steps")
         print("                   --guidance --size --width --height --seed")
-        print("                   --shift --out")
+        print("                   --shift --out --device (cpu, auto or vulkan:N)")
         print()
         print("A video argument opens the Upscale tab with that file loaded.")
         sys.exit(0)

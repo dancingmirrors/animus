@@ -24,7 +24,7 @@ NCNN_ENV = PYTHON="$(VENV_DIR)/bin/python" \
 	$(if $(NCNN_EXTRA_OPTIONS),NCNN_EXTRA_OPTIONS="$(NCNN_EXTRA_OPTIONS)",)
 
 .PHONY: all install uninstall clean help torch torch-ensure ncnn \
-	self-test prune-legacy-install
+	shaders self-test prune-legacy-install
 
 all: help
 
@@ -33,7 +33,8 @@ help:
 	@echo "                   (TORCH_PREBUILT=1 make install uses a prebuilt wheel)"
 	@echo "  make torch       Build a CPU torch wheel from source into wheels/"
 	@echo "  make ncnn        Build ncnn with Vulkan, for GPU upscaling"
-	@echo "  make self-test   Check the installed upscaler against this torch"
+	@echo "  make shaders     Rebuild the Z-Image compute shaders (needs glslang)"
+	@echo "  make self-test   Check the upscalers, Z-Image, and the Vulkan kernels"
 	@echo "  make uninstall   Remove from $(PREFIX)"
 	@echo "  make clean       Clean the virtual environment"
 	@echo ""
@@ -58,6 +59,9 @@ install: torch-ensure prune-legacy-install
 	@mkdir -p $(DESKTOPDIR)
 
 	@install -m 755 animus.py $(LIBDIR)/animus.py
+	@install -m 755 animus_vulkan.py $(LIBDIR)/animus_vulkan.py
+	@mkdir -p $(LIBDIR)/shaders
+	@install -m 644 shaders/* $(LIBDIR)/shaders/
 	@install -m 644 requirements.txt $(LIBDIR)/requirements.txt
 	@install -m 644 README.md $(LIBDIR)/README.md
 	@install -m 644 COPYING $(LIBDIR)/COPYING
@@ -99,6 +103,13 @@ torch:
 
 ncnn:
 	@$(NCNN_ENV) ./build-ncnn.sh
+
+shaders:
+	@if [ ! -x "$(VENV_DIR)/bin/python" ]; then \
+		echo "Run 'make install' first: the shader build uses its virtual environment."; \
+		exit 1; \
+	fi
+	@"$(VENV_DIR)/bin/python" animus_vulkan.py --build-shaders
 
 self-test:
 	@$(VENV_DIR)/bin/python $(LIBDIR)/animus.py --self-test
