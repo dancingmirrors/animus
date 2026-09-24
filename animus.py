@@ -3691,7 +3691,7 @@ def zimage_default_device():
 
 class GeneratePane:
     name = "generate"
-    mode_label = "Generate"
+    mode_label = "Anima"
     output_label = "Generated Image (Anima)"
 
     model_name = "Anima"
