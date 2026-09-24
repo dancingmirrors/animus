@@ -203,7 +203,7 @@ def compile_shader(compiler, source, defines, output):
         command += ["-V", "--target-env", "vulkan1.1"]
         command += [f"-D{define}" for define in defines]
         command += ["-o", str(output), str(source)]
-    result = subprocess.run(command, capture_output=True, text=True)
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
     if result.returncode != 0:
         raise VulkanError(
             f"Compiling {source.name} with {' '.join(defines) or 'no defines'} "
@@ -258,9 +258,8 @@ def stale_shaders(directory=SHADER_DIR):
         source = SHADER_DIR / source_name
         if not source.is_file():
             continue
-        if manifest.get(name) != _source_hash(source, defines):
-            stale.append(name)
-        elif not (Path(directory) / f"{name}.spv").is_file():
+        spv = Path(directory) / f"{name}.spv"
+        if manifest.get(name) != _source_hash(source, defines) or not spv.is_file():
             stale.append(name)
     return stale
 
@@ -355,7 +354,7 @@ def _get_instance():
     )
     try:
         _instance = vk.vkCreateInstance(info, None)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         raise VulkanUnavailable(f"Vulkan could not create an instance ({e}).") from e
     return _instance
 
@@ -365,7 +364,7 @@ def _physical_devices():
     instance = _get_instance()
     try:
         return list(vk.vkEnumeratePhysicalDevices(instance))
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         raise VulkanUnavailable(f"Vulkan found no devices ({e}).") from e
 
 
@@ -404,8 +403,7 @@ def device_index(ident):
     if isinstance(ident, int):
         return ident
     ident = str(ident).strip().lower()
-    if ident.startswith("vulkan:"):
-        ident = ident[len("vulkan:") :]
+    ident = ident.removeprefix("vulkan:")
     try:
         return int(ident)
     except ValueError as e:
@@ -615,13 +613,14 @@ class Device:
         families = vk.vkGetPhysicalDeviceQueueFamilyProperties(self.physical)
         self.queue_family = None
         for family_index, family in enumerate(families):
-            if family.queueFlags & vk.VK_QUEUE_COMPUTE_BIT:
-                if self.queue_family is None or not (
-                    family.queueFlags & vk.VK_QUEUE_GRAPHICS_BIT
-                ):
-                    self.queue_family = family_index
-                    if not family.queueFlags & vk.VK_QUEUE_GRAPHICS_BIT:
-                        break
+            if not family.queueFlags & vk.VK_QUEUE_COMPUTE_BIT:
+                continue
+            if self.queue_family is None or not (
+                family.queueFlags & vk.VK_QUEUE_GRAPHICS_BIT
+            ):
+                self.queue_family = family_index
+                if not family.queueFlags & vk.VK_QUEUE_GRAPHICS_BIT:
+                    break
         if self.queue_family is None:
             raise VulkanError(f"{self.name} has no compute queue.")
 
@@ -1631,7 +1630,8 @@ def read_safetensors(path):
 
     tensors = {}
     handle = safe_open(str(path), framework="pt")
-    for key in handle.keys():
+    # safe_open is not a mapping, so it cannot be iterated without keys().
+    for key in handle.keys():  # noqa: SIM118
         name = normalize_key(key)
 
         def load(key=key, handle=handle):
@@ -1759,20 +1759,20 @@ def detect_config(tensors, shape_of=None):
     ffn_hidden = int(w1[0]) if w1 else int(dim / 3 * 8)
     t_mid = shape_of("t_embedder.mlp.0.weight")
     t_embedder_mid = int(t_mid[0]) if t_mid else 1024
-    return dict(
-        in_channels=in_channels,
-        dim=dim,
-        n_layers=n_layers,
-        n_refiner_layers=n_refiner_layers,
-        n_heads=n_heads,
-        n_kv_heads=n_kv_heads,
-        cap_feat_dim=cap_feat_dim,
-        patch_size=patch_size,
-        f_patch_size=f_patch_size,
-        ffn_hidden=ffn_hidden,
-        t_embedder_mid=t_embedder_mid,
-        head_dim=head_dim,
-    )
+    return {
+        "in_channels": in_channels,
+        "dim": dim,
+        "n_layers": n_layers,
+        "n_refiner_layers": n_refiner_layers,
+        "n_heads": n_heads,
+        "n_kv_heads": n_kv_heads,
+        "cap_feat_dim": cap_feat_dim,
+        "patch_size": patch_size,
+        "f_patch_size": f_patch_size,
+        "ffn_hidden": ffn_hidden,
+        "t_embedder_mid": t_embedder_mid,
+        "head_dim": head_dim,
+    }
 
 
 Z_SEQ_MULTIPLE = 32
@@ -3386,7 +3386,7 @@ class VulkanVAE:
 
     def decode_numpy(self, latent):
         """latent: [C, h, w] float32 numpy -> [3, H, W] float32 numpy."""
-        C, h, w = latent.shape
+        _channels, h, w = latent.shape
         tile = self._tile_size(h, w)
         if tile >= max(h, w):
             return self._decode_tile(latent)
@@ -3455,7 +3455,7 @@ def _blend_h(a, b, extent):
 
 
 def _random_blocks(rng, qtype, n_blocks):
-    block, size = BLOCK_SIZES[qtype]
+    _block, size = BLOCK_SIZES[qtype]
     raw = rng.integers(0, 256, size=(n_blocks, size), dtype=numpy.uint8)
     scales = (rng.random(n_blocks, dtype=numpy.float32) * 0.5 + 0.01).astype(
         numpy.float16

@@ -40,6 +40,7 @@ import traceback
 import urllib.request
 from datetime import datetime
 from pathlib import Path
+from typing import ClassVar
 
 
 def _init_fontconfig():
@@ -3284,7 +3285,7 @@ def build_z_image_transformer(state, config=None, progress=None):
     if missing:
         raise ModelError(
             f"This checkpoint is missing {len(missing)} of the DiT's tensors, "
-            f"starting with {sorted(missing)[0]}."
+            f"starting with {min(missing)}."
         )
     if unexpected and progress is not None:
         progress(
@@ -5236,7 +5237,7 @@ class DiffusersPane(GeneratePane):
     transformer_cls = None
     components_repo = None
     components_prefix = ""
-    component_repos = {}
+    component_repos: ClassVar[dict[str, tuple]] = {}
     gguf_repo = None
     gguf_preference = GGUF_QUANT_PREFERENCE
     gguf_prefer = ()
@@ -5331,7 +5332,7 @@ class DiffusersPane(GeneratePane):
             )
 
     def _subfolder(self, name):
-        repo, prefix = self._component_source(name)
+        _repo, prefix = self._component_source(name)
         return f"{prefix}/{name}" if prefix else name
 
     def _component_source(self, name):
@@ -5356,10 +5357,9 @@ class DiffusersPane(GeneratePane):
                 data = getattr(param, "data", param)
                 if data.numel() == 0:
                     continue
-                if data.is_floating_point():
-                    if not torch.isfinite(data).all():
-                        bad.append(name)
-                        continue
+                if data.is_floating_point() and not torch.isfinite(data).all():
+                    bad.append(name)
+                    continue
                 if bool((data == 0).all()):
                     empty.append(name)
             except Exception:  # noqa: BLE001
@@ -6115,7 +6115,7 @@ class NativeZImagePane(DiffusersPane):
                 ]
                 if not names:
                     raise ModelError(f"{path} has no .safetensors in it.")
-                local = Path(hf_hub_download(repo_id=path, filename=sorted(names)[0]))
+                local = Path(hf_hub_download(repo_id=path, filename=min(names)))
         if local is None:
             raise ModelError(f"Could not find a LoRA at {path}.")
 
@@ -7968,15 +7968,15 @@ def _self_test_zimage(check):
         return
 
     torch.manual_seed(0)
-    shape = dict(
-        in_channels=4,
-        dim=256,
-        n_layers=2,
-        n_refiner_layers=1,
-        n_heads=2,
-        n_kv_heads=2,
-        cap_feat_dim=24,
-    )
+    shape = {
+        "in_channels": 4,
+        "dim": 256,
+        "n_layers": 2,
+        "n_refiner_layers": 1,
+        "n_heads": 2,
+        "n_kv_heads": 2,
+        "cap_feat_dim": 24,
+    }
     try:
         reference = ZImageTransformer(**shape).eval()
     except Exception as e:  # noqa: BLE001
@@ -8154,15 +8154,15 @@ def _self_test_vulkan(check):
     caption = torch.randn(13, 24)
     latent = torch.randn(4, 1, 12, 20)
     timestep = torch.tensor([0.42])
-    base = dict(
-        in_channels=4,
-        dim=256,
-        n_layers=2,
-        n_refiner_layers=1,
-        n_heads=2,
-        n_kv_heads=2,
-        cap_feat_dim=24,
-    )
+    base = {
+        "in_channels": 4,
+        "dim": 256,
+        "n_layers": 2,
+        "n_refiner_layers": 1,
+        "n_heads": 2,
+        "n_kv_heads": 2,
+        "cap_feat_dim": 24,
+    }
     grouped = dict(base, n_layers=1, n_kv_heads=1)
 
     for label, shape, quantize, tolerance in (
