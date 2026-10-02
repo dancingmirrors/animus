@@ -2,6 +2,7 @@ Animus
 ======
 A text to image Anima GUI for machines without CUDA, AVX2, and so on, or Z-Image with optional Vulkan acceleration.
 Also a SPAN or Real-ESRGAN video upscaler with completely different design goals (try ```NCNN=1 make install```).
+And a promptless image upscaler (Real-ESRGAN for photos or Real-CUGAN for anime.
 
 
 ```

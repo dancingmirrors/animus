@@ -37,7 +37,9 @@ import subprocess
 import threading
 import time
 import traceback
+import types
 import urllib.request
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import ClassVar
@@ -68,7 +70,8 @@ import gi
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 gi.require_version("GdkPixbuf", "2.0")
-from gi.repository import Gdk, GdkPixbuf, GLib, Gtk
+gi.require_version("Pango", "1.0")
+from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, Pango
 import warnings
 
 warnings.filterwarnings(
@@ -116,6 +119,7 @@ except Exception:  # noqa: BLE001
         ClassifierFreeGuidance = None
 
 from PIL import Image as _PILImage
+from PIL import ImageOps
 from PIL.PngImagePlugin import PngInfo
 
 _PILImage.preinit()
@@ -333,6 +337,7 @@ _prune_legacy_dir()
 
 VIDEO_DIR = DATA_DIR / "upscales"
 UPSCALER_DIR = DATA_DIR / "upscalers"
+CUGAN_DIR = UPSCALER_DIR / "Real-CUGAN"
 
 LEGACY_UPSCALE_FILE = CONFIG_DIR / "upscale.json"
 
@@ -950,6 +955,11 @@ LIVE_ACTION_SPAN = (
     "https://raw.githubusercontent.com/jcj83429/upscaling/"
     "5d8cdd2e17750b64be39ccab3a8763d91128fe15/2xLiveActionV1_SPAN"
 )
+REAL_CUGAN_ARCHIVE = (
+    "https://github.com/bilibili/ailab/releases/download/Real-CUGAN/"
+    "updated_weights.zip"
+)
+REAL_CUGAN_ID = "Real-CUGAN"
 
 MODEL_LICENSES = {
     "2xLiveActionV1_SPAN.pth": "Apache-2.0",
@@ -957,6 +967,9 @@ MODEL_LICENSES = {
     "realesr-animevideov3.pth": "BSD-3-Clause",
     "RealESRGAN_x4plus_anime_6B.pth": "BSD-3-Clause",
     "RealESRGAN_x4plus.pth": "BSD-3-Clause",
+    "RealESRGAN_x2plus.pth": "BSD-3-Clause",
+    "realesr-general-wdn-x4v3.pth": "BSD-3-Clause",
+    REAL_CUGAN_ID: "MIT",
 }
 
 PERMISSIVE_LICENSES = frozenset(("Apache-2.0", "BSD-3-Clause", "MIT", "CC0-1.0"))
@@ -986,6 +999,17 @@ BUILTIN_MODELS = (
         "Photo (heavy, RRDB)",
         "RealESRGAN_x4plus.pth",
         f"{REAL_ESRGAN_RELEASES}/v0.1.0/RealESRGAN_x4plus.pth",
+    ),
+)
+
+EXTRA_WEIGHTS = (
+    (
+        "RealESRGAN_x2plus.pth",
+        f"{REAL_ESRGAN_RELEASES}/v0.2.1/RealESRGAN_x2plus.pth",
+    ),
+    (
+        "realesr-general-wdn-x4v3.pth",
+        f"{REAL_ESRGAN_RELEASES}/v0.2.5.0/realesr-general-wdn-x4v3.pth",
     ),
 )
 
@@ -1082,6 +1106,76 @@ _FFMPEG_PROGRESS = re.compile(
     r"^(frame|fps|bitrate|total_size|out_time\w*|dup_frames|drop_frames|speed"
     r"|progress|stream_\d+_\d+_q)=(.*)$"
 )
+
+REAL_ESRGAN_ID = "Real-ESRGAN"
+GENERAL_BLEND_ID = "realesr-general-x4v3-dn0.5"
+GENERAL_BLEND_SOURCES = ("realesr-general-x4v3.pth", "realesr-general-wdn-x4v3.pth")
+GENERAL_DENOISE = 0.5
+
+IMAGE_MODELS = (
+    ("Photo: Real-ESRGAN", REAL_ESRGAN_ID),
+    ("Photo: Real-ESRGAN compact (fast)", GENERAL_BLEND_ID),
+    ("Anime: Real-CUGAN (waifu2x-style)", REAL_CUGAN_ID),
+    ("Anime: Real-ESRGAN (sharper, slow)", "RealESRGAN_x4plus_anime_6B.pth"),
+    ("Anime: Real-ESRGAN compact (fast)", "realesr-animevideov3.pth"),
+)
+IMAGE_FAMILIES = {
+    REAL_ESRGAN_ID: {2: "RealESRGAN_x2plus.pth", 4: "RealESRGAN_x4plus.pth"},
+}
+DEFAULT_IMAGE_MODEL = REAL_ESRGAN_ID
+
+CUGAN_SCALES = (2, 3, 4)
+CUGAN_LEVELS = (
+    ("conservative", "Conservative"),
+    ("no-denoise", "No denoise"),
+    ("denoise1x", "Denoise, light"),
+    ("denoise2x", "Denoise, medium"),
+    ("denoise3x", "Denoise, strong"),
+)
+CUGAN_LEVELS_ABOVE_X2 = ("conservative", "no-denoise", "denoise3x")
+DEFAULT_CUGAN_LEVEL = "conservative"
+
+IMAGE_PRESETS = (
+    ("x1", "1x (clean up only)", "scale", 1.0),
+    ("x2", "2x source size", "scale", 2.0),
+    ("x3", "3x source size", "scale", 3.0),
+    ("x4", "4x source size", "scale", 4.0),
+    ("fit", "Fit inside...", "fit", 0),
+)
+DEFAULT_IMAGE_PRESET = "x2"
+MEMORY_SHARE = 0.5
+NCNN_MEMORY_BUDGET = 2 << 30
+
+IMAGE_FORMATS = (
+    ("png", "PNG"),
+    ("webp", "WebP"),
+    ("jpg", "JPEG"),
+)
+DEFAULT_IMAGE_FORMAT = "png"
+DEFAULT_IMAGE_QUALITY = 95
+FORMAT_LIMITS = {"webp": 16383, "jpg": 65500}
+
+IMAGE_PATTERNS = (
+    "*.png",
+    "*.jpg",
+    "*.jpeg",
+    "*.jfif",
+    "*.webp",
+    "*.avif",
+    "*.bmp",
+    "*.gif",
+    "*.tif",
+    "*.tiff",
+    "*.tga",
+    "*.ppm",
+    "*.pgm",
+)
+IMAGE_SUFFIXES = frozenset(pattern[1:] for pattern in IMAGE_PATTERNS)
+
+ALPHA_BLEED_STEPS = 16
+RESULT_BYTES_PER_PIXEL = 20
+RESULT_DISPLAY_LIMIT = 4096
+EXIF_ORIENTATION = 0x0112
 
 
 def _activation(act_type, num_feat):
@@ -1331,6 +1425,215 @@ class SPAN(nn.Module):
         return self.upsampler(joined)
 
 
+class CuganSE(nn.Module):
+    def __init__(self, channels, reduction=8):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels // reduction, 1, 1, 0, bias=True)
+        self.conv2 = nn.Conv2d(channels // reduction, channels, 1, 1, 0, bias=True)
+
+    def forward(self, x, mean=None):
+        if mean is None:
+            wide = torch.promote_types(x.dtype, torch.float32)
+            mean = x.mean(dim=(2, 3), keepdim=True, dtype=wide).to(x.dtype)
+        return x * torch.sigmoid(self.conv2(F.relu(self.conv1(mean))))
+
+
+class CuganConv(nn.Module):
+    def __init__(self, in_channels, mid_channels, out_channels, se):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, mid_channels, 3, 1, 0),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(mid_channels, out_channels, 3, 1, 0),
+            nn.LeakyReLU(0.1, inplace=True),
+        )
+        self.seblock = CuganSE(out_channels) if se else None
+
+
+class CuganUNet1(nn.Module):
+    def __init__(self, out_channels, scale):
+        super().__init__()
+        self.conv1 = CuganConv(3, 32, 64, se=False)
+        self.conv1_down = nn.Conv2d(64, 64, 2, 2, 0)
+        self.conv2 = CuganConv(64, 128, 64, se=True)
+        self.conv2_up = nn.ConvTranspose2d(64, 64, 2, 2, 0)
+        self.conv3 = nn.Conv2d(64, 64, 3, 1, 0)
+        if scale == 3:
+            self.conv_bottom = nn.ConvTranspose2d(64, out_channels, 5, 3, 2)
+        else:
+            self.conv_bottom = nn.ConvTranspose2d(64, out_channels, 4, 2, 3)
+
+
+class CuganUNet2(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.conv1 = CuganConv(channels, 32, 64, se=False)
+        self.conv1_down = nn.Conv2d(64, 64, 2, 2, 0)
+        self.conv2 = CuganConv(64, 64, 128, se=True)
+        self.conv2_down = nn.Conv2d(128, 128, 2, 2, 0)
+        self.conv3 = CuganConv(128, 256, 128, se=True)
+        self.conv3_up = nn.ConvTranspose2d(128, 128, 2, 2, 0)
+        self.conv4 = CuganConv(128, 64, 64, se=True)
+        self.conv4_up = nn.ConvTranspose2d(64, 64, 2, 2, 0)
+        self.conv5 = nn.Conv2d(64, 64, 3, 1, 0)
+        self.conv_bottom = nn.Conv2d(64, channels, 3, 1, 0)
+
+
+CUGAN_STAGE_COSTS = (1, 4, 6, 8, 10)
+
+
+class RealCUGAN(nn.Module):
+    def __init__(self, scale=2, pro=False):
+        super().__init__()
+        if scale not in (2, 3, 4):
+            raise ValueError(f"Real-CUGAN comes in x2, x3 and x4, not x{scale}.")
+        self.scale = scale
+        self.num_out_ch = 3
+        self.pro = pro
+        self.inner = 3 if scale == 3 else 2
+        self.margin = {2: 18, 3: 14, 4: 19}[scale]
+        self.multiple = 4 if scale == 3 else 2
+
+        channels = 64 if scale == 4 else 3
+        self.unet1 = CuganUNet1(channels, self.inner)
+        self.unet2 = CuganUNet2(channels)
+        if scale == 4:
+            self.conv_final = nn.Conv2d(64, 12, 3, 1, 0)
+
+    def _stage_ratio(self, stage):
+        return ((1, 2), (self.inner, 2), (self.inner, 4), (self.inner, 2))[stage]
+
+    def _run(self, x, means=(), stop_at=None):
+        def gate(block, z, stage):
+            return block.seblock(z, means[stage] if stage < len(means) else None)
+
+        one, two = self.unet1, self.unet2
+
+        x1 = one.conv1.conv(x)
+        x2 = F.leaky_relu(one.conv1_down(x1), 0.1, inplace=True)
+        x1 = x1[:, :, 4:-4, 4:-4]
+        z = one.conv2.conv(x2)
+        if stop_at == 0:
+            return z
+        x2 = F.leaky_relu(one.conv2_up(gate(one.conv2, z, 0)), 0.1, inplace=True)
+        x3 = F.leaky_relu(one.conv3(x1 + x2), 0.1, inplace=True)
+        base = one.conv_bottom(x3)
+        del x1, x2, x3
+
+        y1 = two.conv1.conv(base)
+        y2 = F.leaky_relu(two.conv1_down(y1), 0.1, inplace=True)
+        y1 = y1[:, :, 16:-16, 16:-16]
+        z = two.conv2.conv(y2)
+        if stop_at == 1:
+            return z
+        y2 = gate(two.conv2, z, 1)
+        y3 = F.leaky_relu(two.conv2_down(y2), 0.1, inplace=True)
+        y2 = y2[:, :, 4:-4, 4:-4]
+        z = two.conv3.conv(y3)
+        if stop_at == 2:
+            return z
+        y3 = F.leaky_relu(two.conv3_up(gate(two.conv3, z, 2)), 0.1, inplace=True)
+        z = two.conv4.conv(y2 + y3)
+        if stop_at == 3:
+            return z
+        y4 = F.leaky_relu(two.conv4_up(gate(two.conv4, z, 3)), 0.1, inplace=True)
+        del y2, y3, z
+        y5 = F.leaky_relu(two.conv5(y1 + y4), 0.1, inplace=True)
+        del y1, y4
+        out = two.conv_bottom(y5) + base[:, :, 20:-20, 20:-20]
+
+        if self.scale == 4:
+            out = F.pixel_shuffle(self.conv_final(out)[:, :, 1:-1, 1:-1], 2)
+        return out
+
+    def _pad(self, x):
+        height, width = x.shape[-2:]
+        bottom = self.margin + (-height) % self.multiple
+        right = self.margin + (-width) % self.multiple
+        mode = "reflect" if min(height, width) > max(bottom, right) else "replicate"
+        return F.pad(x, (self.margin, right, self.margin, bottom), mode=mode)
+
+    def forward(self, x):
+        return self.upscale_tiled(x)
+
+    def upscale_tiled(self, frame, tile=0, stop_check=None, on_tile=None):
+        height, width = frame.shape[-2:]
+        source = frame * 0.7 + 0.15 if self.pro else frame
+        padded = self._pad(source)
+        rows = padded.shape[-2] - 2 * self.margin
+        cols = padded.shape[-1] - 2 * self.margin
+
+        step = max(self.multiple, tile - tile % self.multiple)
+        if tile <= 0 or (step >= rows and step >= cols):
+            output = self._run(padded)
+        else:
+            output = self._run_tiles(padded, rows, cols, step, stop_check, on_tile)
+            if output is None:
+                return None
+
+        output = output[:, :, : height * self.scale, : width * self.scale]
+        if self.scale == 4:
+            output = output + F.interpolate(source, scale_factor=4, mode="nearest")
+        if self.pro:
+            output = (output - 0.15) / 0.7
+        return output
+
+    def _run_tiles(self, padded, rows, cols, step, stop_check=None, on_tile=None):
+        reach = 2 * self.margin
+        boxes = [
+            (top, min(top + step, rows), left, min(left + step, cols))
+            for top in range(0, rows, step)
+            for left in range(0, cols, step)
+        ]
+        total = sum(CUGAN_STAGE_COSTS) * len(boxes)
+        done = 0
+
+        def patch(box):
+            top, bottom, left, right = box
+            return padded[:, :, top : bottom + reach, left : right + reach]
+
+        def advance(stage):
+            nonlocal done
+            done += CUGAN_STAGE_COSTS[stage]
+            if on_tile is not None:
+                on_tile(done, total)
+
+        wide = torch.promote_types(padded.dtype, torch.float32)
+        means = []
+        for stage in range(4):
+            num, den = self._stage_ratio(stage)
+            summed, count = 0.0, 0
+            for box in boxes:
+                if stop_check is not None and stop_check():
+                    return None
+                z = self._run(patch(box), means, stop_at=stage)
+                top, bottom, left, right = box
+                tall = z.shape[-2] if bottom == rows else (bottom - top) * num // den
+                across = z.shape[-1] if right == cols else (right - left) * num // den
+                summed = summed + z[:, :, :tall, :across].sum(
+                    dim=(2, 3), keepdim=True, dtype=wide
+                )
+                count += tall * across
+                del z
+                advance(stage)
+            means.append((summed / count).to(padded.dtype))
+
+        output = None
+        for box in boxes:
+            if stop_check is not None and stop_check():
+                return None
+            result = self._run(patch(box), means)
+            if output is None:
+                output = result.new_empty(
+                    (*result.shape[:2], rows * self.scale, cols * self.scale)
+                )
+            top, bottom, left, right = (side * self.scale for side in box)
+            output[:, :, top:bottom, left:right] = result
+            del result
+            advance(4)
+        return output
+
+
 def read_state_dict(path):
     path = Path(path)
 
@@ -1395,9 +1698,30 @@ def build_span(state_dict):
     return model, upscale, 1, min_overlap, description
 
 
+def build_cugan(state_dict):
+    if "conv_final.weight" in state_dict:
+        scale = 4
+    else:
+        kernel = int(state_dict["unet1.conv_bottom.weight"].shape[-1])
+        scale = {4: 2, 5: 3}.get(kernel)
+        if scale is None:
+            raise ValueError(
+                f"A {kernel}x{kernel} final deconvolution is not one of the "
+                "Real-CUGAN scales."
+            )
+
+    pro = state_dict.pop("pro", None) is not None
+    model = RealCUGAN(scale=scale, pro=pro)
+    description = f"Real-CUGAN x{scale}" + (" pro" if pro else "")
+    return model, scale, model.multiple, 0, description
+
+
 def build_upscaler(state_dict):
     if "conv_1.sk.weight" in state_dict:
         return build_span(state_dict)
+
+    if "unet1.conv1.conv.0.weight" in state_dict:
+        return build_cugan(state_dict)
 
     if "conv_first.weight" in state_dict:
         weight = state_dict["conv_first.weight"]
@@ -1439,7 +1763,7 @@ def build_upscaler(state_dict):
     conv_indices = sorted(i for i, dim in indices.items() if dim == 4)
     if not conv_indices or conv_indices[0] != 0:
         raise ValueError(
-            "Unrecognized checkpoint. This reads SPAN and the two "
+            "Unrecognized checkpoint. This reads SPAN, Real-CUGAN and the two "
             "Real-ESRGAN architectures - SRVGGNetCompact (realesr-*v3) and "
             "RRDBNet (RealESRGAN_x*plus, plain ESRGAN) and nothing else. "
             "Other designs such as OmniSR or DAT would each need their own "
@@ -1532,6 +1856,10 @@ def ncnn_option_overrides():
 
 
 BINARY_ADD, BINARY_SUB, BINARY_MUL = 0, 1, 2
+
+
+class NcnnUnsupportedError(TypeError):
+    pass
 
 
 class NcnnGraph:
@@ -1638,12 +1966,16 @@ class NcnnGraph:
             ]
             lines.append(" ".join(fields).rstrip())
 
-        Path(param_path).parent.mkdir(parents=True, exist_ok=True)
-        with open(param_path, "w") as handle:
+        param_path, bin_path = Path(param_path), Path(bin_path)
+        param_path.parent.mkdir(parents=True, exist_ok=True)
+        param_part = param_path.with_name(param_path.name + ".part")
+        bin_part = bin_path.with_name(bin_path.name + ".part")
+
+        with open(param_part, "w") as handle:
             handle.write(f"{NCNN_MAGIC}\n{len(lines)} {len(blobs)}\n")
             handle.write("\n".join(lines) + "\n")
 
-        with open(bin_path, "wb") as handle:
+        with open(bin_part, "wb") as handle:
             for layer in self.layers:
                 for flagged, tensor in layer["weights"]:
                     if flagged:
@@ -1651,6 +1983,9 @@ class NcnnGraph:
                     handle.write(
                         tensor.detach().to(torch.float32).contiguous().numpy().tobytes()
                     )
+
+        os.replace(bin_part, bin_path)
+        os.replace(param_part, param_path)
 
 
 def _write_compact_ncnn(graph, model, state_dict, scale):
@@ -1838,7 +2173,7 @@ def write_ncnn_model(state_dict, param_path, bin_path):
     elif isinstance(model, SRVGGNetCompact):
         _write_compact_ncnn(graph, model, state_dict, scale)
     else:
-        raise TypeError(f"{description} has no ncnn converter.")
+        raise NcnnUnsupportedError(f"{description} has no ncnn converter.")
     graph.write(param_path, bin_path)
 
     return built
@@ -1967,6 +2302,7 @@ def load_ncnn_upscaler(weights, gpu=None, threads=0, fp16=True):
         gpu=gpu,
         fp16=fp16,
     )
+    model.architecture = type(network)
 
     if gpu is not None and not model.on_gpu:
         print(
@@ -2023,6 +2359,26 @@ def preferred_device():
     return "cpu"
 
 
+def open_upscaler(weights, device, threads=0, dtype=torch.float32, channels_last=True):
+    if device.startswith("ncnn:"):
+        try:
+            loaded = load_ncnn_upscaler(
+                weights,
+                gpu=int(device.partition(":")[2] or 0),
+                threads=threads,
+                fp16=dtype is not torch.float32,
+            )
+            return loaded, "cpu", torch.float32
+        except NcnnUnsupportedError as e:
+            update_status(f"{e} It runs through torch on the CPU instead.")
+            device, dtype = "cpu", torch.float32
+
+    loaded = load_upscaler(
+        weights, device=device, channels_last=channels_last, dtype=dtype
+    )
+    return loaded, device, dtype
+
+
 def _pad_frame(frame, pre_pad, size_multiple):
     height, width = frame.shape[-2:]
     pad = max(0, min(pre_pad, height - 1, width - 1))
@@ -2048,7 +2404,12 @@ def upscale_frame(
     size_multiple=1,
     pre_pad=DEFAULT_PRE_PAD,
     stop_check=None,
+    on_tile=None,
 ):
+    tiler = getattr(model, "upscale_tiled", None)
+    if tiler is not None:
+        return tiler(frame, tile, stop_check=stop_check, on_tile=on_tile)
+
     height, width = frame.shape[-2:]
     padded, offset = _pad_frame(frame, pre_pad, size_multiple)
     padded_h, padded_w = padded.shape[-2:]
@@ -2062,6 +2423,8 @@ def upscale_frame(
         output = padded.new_empty(
             (padded.shape[0], model.num_out_ch, padded_h * scale, padded_w * scale)
         )
+        total = -(-padded_h // step) * -(-padded_w // step)
+        done = 0
 
         for y in range(0, padded_h, step):
             for x in range(0, padded_w, step):
@@ -2086,6 +2449,10 @@ def upscale_frame(
                 output[:, :, y * scale : in_y1 * scale, x * scale : in_x1 * scale] = (
                     out_patch[:, :, cut_y0:cut_y1, cut_x0:cut_x1]
                 )
+
+                done += 1
+                if on_tile is not None:
+                    on_tile(done, total)
 
     if offset:
         output = output[
@@ -2154,6 +2521,428 @@ def download_model(url, dest, progress=None, stop_check=None):
         except OSError:
             pass
         raise
+
+
+def weights_url(model_id):
+    if model_id == REAL_CUGAN_ID:
+        return REAL_CUGAN_ARCHIVE
+    for _label, name, url in BUILTIN_MODELS:
+        if name == model_id:
+            return url
+    return dict(EXTRA_WEIGHTS).get(model_id)
+
+
+def cugan_weights(scale, level):
+    if scale != 2 and level not in CUGAN_LEVELS_ABOVE_X2:
+        level = "denoise3x"
+    return CUGAN_DIR / f"up{scale}x-latest-{level}.pth"
+
+
+def fetch_cugan_weights(progress=None, stop_check=None):
+    archive = CUGAN_DIR / Path(REAL_CUGAN_ARCHIVE).name
+    download_model(
+        REAL_CUGAN_ARCHIVE, archive, progress=progress, stop_check=stop_check
+    )
+
+    extracted = []
+    try:
+        with zipfile.ZipFile(archive) as bundle:
+            for member in bundle.infolist():
+                name = Path(member.filename).name
+                if member.is_dir() or not name.endswith(".pth"):
+                    continue
+                target = CUGAN_DIR / name
+                partial = target.with_name(name + ".part")
+                with bundle.open(member) as source, open(partial, "wb") as handle:
+                    shutil.copyfileobj(source, handle)
+                os.replace(partial, target)
+                extracted.append(name)
+    finally:
+        with contextlib.suppress(OSError):
+            archive.unlink()
+
+    if not extracted:
+        raise OSError(f"{archive.name} held no Real-CUGAN weights.")
+    return extracted
+
+
+def image_model_files(model_id):
+    if model_id == GENERAL_BLEND_ID:
+        return set(GENERAL_BLEND_SOURCES)
+    return set(IMAGE_FAMILIES.get(model_id, {}).values()) or {model_id}
+
+
+def blend_weights(strong, weak, strength, dest):
+    first, second = read_state_dict(strong), read_state_dict(weak)
+    if first.keys() != second.keys():
+        raise ValueError(f"{Path(strong).name} and {Path(weak).name} do not match.")
+
+    mixed = {
+        key: strength * first[key] + (1.0 - strength) * second[key] for key in first
+    }
+    dest = Path(dest)
+    partial = dest.with_name(dest.name + ".part")
+    torch.save({"params": mixed}, partial)
+    os.replace(partial, dest)
+    return dest
+
+
+def image_weights(model_id, width, height, out_width, out_height, level):
+    if model_id == REAL_CUGAN_ID:
+        scale = pick_scale(CUGAN_SCALES, width, height, out_width, out_height)
+        return cugan_weights(scale, level)
+    if model_id == GENERAL_BLEND_ID:
+        return UPSCALER_DIR / f"{GENERAL_BLEND_ID}.pth"
+    family = IMAGE_FAMILIES.get(model_id)
+    if family is not None:
+        scale = pick_scale(family, width, height, out_width, out_height)
+        return UPSCALER_DIR / family[scale]
+    return UPSCALER_DIR / model_id
+
+
+def fetch_weights(weights, progress=None, stop_check=None):
+    weights = Path(weights)
+    if weights.parent == CUGAN_DIR:
+        update_status(
+            "Downloading the Real-CUGAN weights, every scale and denoise level "
+            "in one archive..."
+        )
+        fetch_cugan_weights(progress=progress, stop_check=stop_check)
+        owner = REAL_CUGAN_ID
+    elif weights.name == f"{GENERAL_BLEND_ID}.pth":
+        sources = [UPSCALER_DIR / name for name in GENERAL_BLEND_SOURCES]
+        for source in sources:
+            if not source.exists():
+                fetch_weights(source, progress, stop_check)
+        blend_weights(*sources, GENERAL_DENOISE, weights)
+        update_status(
+            f"Mixed {sources[0].name} with its weak-denoise twin at strength "
+            f"{GENERAL_DENOISE:g}, the way Real-ESRGAN does by default."
+        )
+        return weights
+    else:
+        url = weights_url(weights.name)
+        if url is None:
+            raise FileNotFoundError(f"No such weights file: {weights}")
+        update_status(f"Downloading {weights.name}...")
+        download_model(url, weights, progress=progress, stop_check=stop_check)
+        owner = weights.name
+
+    update_status(f"Saved {owner} in {weights.parent}.")
+    terms = MODEL_LICENSES.get(owner)
+    if terms:
+        update_status(f"{owner} is under {terms}.")
+    if not weights.exists():
+        raise FileNotFoundError(f"The download did not include {weights.name}.")
+    return weights
+
+
+def is_image_path(path):
+    return Path(path).suffix.lower() in IMAGE_SUFFIXES
+
+
+def gather_images(paths):
+    found, missing = [], []
+    for raw in paths:
+        path = Path(raw).expanduser()
+        if path.is_dir():
+            found.extend(
+                sorted(
+                    child
+                    for child in path.iterdir()
+                    if child.is_file() and is_image_path(child)
+                )
+            )
+        elif path.is_file():
+            found.append(path)
+        else:
+            missing.append(path)
+    return list(dict.fromkeys(found)), missing
+
+
+def read_image(path):
+    with _PILImage.open(path) as opened:
+        keys = list(getattr(opened, "text", None) or {})
+        frames = getattr(opened, "n_frames", 1)
+        image = ImageOps.exif_transpose(opened)
+
+    text = {
+        key: image.info[key]
+        for key in keys
+        if isinstance(image.info.get(key), str)
+        and not key.startswith("Raw profile type")
+    }
+    exif = image.getexif()
+    return {
+        "image": image,
+        "text": text,
+        "frames": frames,
+        "icc_profile": image.info.get("icc_profile"),
+        "exif": exif.tobytes() if len(exif) else None,
+    }
+
+
+def split_image(image):
+    mode = image.mode
+    if mode.startswith("I") or mode == "F":
+        values = numpy.asarray(image, dtype=numpy.float32)
+        peak = float(values.max(initial=0.0))
+        if mode.startswith("I;16") or (mode == "I" and peak > 255.0):
+            values = values / 257.0
+        elif mode == "F" and peak <= 1.0:
+            values = values * 255.0
+        image = _PILImage.fromarray(values.clip(0.0, 255.0).round().astype(numpy.uint8))
+    elif mode == "P":
+        image = image.convert("RGBA" if "transparency" in image.info else "RGB")
+    elif mode in ("L", "RGB") and "transparency" in image.info:
+        image = image.convert("LA" if mode == "L" else "RGBA")
+    elif mode in ("PA", "La", "RGBa"):
+        image = image.convert("LA" if mode == "La" else "RGBA")
+    elif mode == "1":
+        image = image.convert("L")
+
+    if image.mode not in ("RGB", "RGBA", "L", "LA"):
+        image = image.convert("RGB")
+
+    alpha = None
+    if image.mode in ("RGBA", "LA"):
+        alpha = image.getchannel("A")
+        if alpha.getextrema()[0] == 255:
+            alpha = None
+
+    return image.convert("RGB"), alpha, image.mode in ("L", "LA")
+
+
+def image_to_tensor(image):
+    array = numpy.array(image, dtype=numpy.uint8)
+    if array.ndim == 2:
+        array = array[:, :, None]
+    return torch.from_numpy(array).permute(2, 0, 1).unsqueeze(0).float().div_(255.0)
+
+
+def tensor_to_array(tensor):
+    planes = tensor[0].detach().to("cpu", torch.float32)
+    planes = planes.mul_(255.0).round_().clamp_(0.0, 255.0)
+    array = torch.empty((*planes.shape[1:], planes.shape[0]), dtype=torch.uint8)
+    array.copy_(planes.permute(1, 2, 0))
+    return array.numpy()
+
+
+def bleed_transparent(rgb, alpha, steps=ALPHA_BLEED_STEPS):
+    known = (alpha > 0).to(rgb.dtype)
+    if bool(known.all()) or not bool(known.any()):
+        return rgb
+
+    color = rgb * known
+    for _ in range(steps):
+        reach = F.avg_pool2d(known, 3, 1, 1, count_include_pad=False)
+        fresh = (known == 0) & (reach > 0)
+        if not bool(fresh.any()):
+            break
+        spread = F.avg_pool2d(color, 3, 1, 1, count_include_pad=False)
+        color = torch.where(fresh, spread / reach.clamp_min(1e-6), color)
+        known = torch.where(fresh, torch.ones_like(known), known)
+
+    return torch.where(known > 0, color, rgb)
+
+
+@contextlib.contextmanager
+def interruptible(model, stop_check):
+    if stop_check is None or not isinstance(model, nn.Module):
+        yield
+        return
+
+    def check(_module, _inputs):
+        if stop_check():
+            raise KeyboardInterrupt()
+
+    handles = [module.register_forward_pre_hook(check) for module in model.modules()]
+    try:
+        yield
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
+def upscale_image(
+    model,
+    image,
+    scale,
+    tile,
+    tile_pad,
+    size_multiple=1,
+    device="cpu",
+    dtype=torch.float32,
+    channels_last=True,
+    stop_check=None,
+    on_progress=None,
+):
+    rgb, alpha, gray = split_image(image)
+    memory_format = torch.channels_last if channels_last else torch.contiguous_format
+    passes = 1 if alpha is None else 2
+
+    def run(planes, index):
+        def report(done, total):
+            if on_progress is not None:
+                on_progress((index + done / max(total, 1)) / passes)
+
+        planes = planes.contiguous(memory_format=memory_format)
+        return upscale_frame(
+            model,
+            planes.to(device=device, dtype=dtype),
+            scale,
+            tile,
+            tile_pad,
+            size_multiple=size_multiple,
+            stop_check=stop_check,
+            on_tile=report,
+        )
+
+    colors = image_to_tensor(rgb)
+    mask = None
+    if alpha is not None:
+        mask = image_to_tensor(alpha)
+        colors = bleed_transparent(colors, mask)
+
+    with torch.inference_mode(), interruptible(model, stop_check):
+        result = run(colors, 0)
+        if result is None:
+            return None
+        upscaled = _PILImage.fromarray(tensor_to_array(result))
+        del result, colors
+        if gray:
+            upscaled = upscaled.convert("L")
+
+        if mask is not None:
+            result = run(mask.expand(-1, 3, -1, -1), 1)
+            if result is None:
+                return None
+            opacity = tensor_to_array(result.mean(dim=1, keepdim=True))[:, :, 0]
+            upscaled.putalpha(_PILImage.fromarray(opacity))
+
+    return upscaled
+
+
+def available_memory():
+    try:
+        with open("/proc/meminfo") as handle:
+            for line in handle:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def architecture_of(model):
+    return getattr(model, "architecture", type(model))
+
+
+def is_heavy(model):
+    return issubclass(architecture_of(model), RRDBNet)
+
+
+def memory_per_pixel(model, scale):
+    if issubclass(architecture_of(model), RealCUGAN):
+        return {2: 4400, 3: 9600, 4: 5600}[scale]
+    if is_heavy(model):
+        return 640 * scale * scale
+    return 1024 + 16 * scale * scale
+
+
+def memory_budget(device):
+    if device.startswith("ncnn:"):
+        return NCNN_MEMORY_BUDGET
+    if device.startswith(("cuda", "xpu")):
+        try:
+            backend = getattr(torch, device.partition(":")[0])
+            return backend.mem_get_info(torch.device(device))[0] * MEMORY_SHARE
+        except Exception:  # noqa: BLE001
+            return None
+    free = available_memory()
+    return free * MEMORY_SHARE if free else None
+
+
+def fit_tile(width, height, per_pixel, budget, multiple=32):
+    if width * height * per_pixel <= budget:
+        return 0
+    tile = math.isqrt(int(budget // per_pixel)) * 2 // 3
+    return max(2 * multiple, tile - tile % multiple)
+
+
+def image_target_size(width, height, preset_id, custom_width, custom_height):
+    factor = min(custom_width / max(width, 1), custom_height / max(height, 1))
+    for ident, _label, mode, value in IMAGE_PRESETS:
+        if ident == preset_id and mode == "scale":
+            factor = value
+    return max(1, round(width * factor)), max(1, round(height * factor))
+
+
+def pick_scale(scales, width, height, out_width, out_height):
+    needed = max(out_width / max(width, 1), out_height / max(height, 1))
+    for scale in sorted(scales):
+        if scale >= needed - 1e-6:
+            return scale
+    return max(scales)
+
+
+def unique_path(path):
+    path = Path(path)
+    candidate, index = path, 2
+    while candidate.exists():
+        candidate = path.with_name(f"{path.stem}_{index}{path.suffix}")
+        index += 1
+    return candidate
+
+
+def output_format(fmt, image):
+    if fmt == "jpg" and image.mode in ("RGBA", "LA"):
+        return "png", "JPEG cannot hold transparency"
+    limit = FORMAT_LIMITS.get(fmt)
+    if limit and max(image.size) > limit:
+        return "png", f"{dict(IMAGE_FORMATS)[fmt]} stops at {limit} px"
+    return fmt, None
+
+
+def icc_fits(profile, mode, fmt):
+    space = profile[16:20] if len(profile) >= 20 else b""
+    if mode in ("L", "LA") and fmt != "webp":
+        return space == b"GRAY"
+    return space == b"RGB "
+
+
+def save_image(
+    image,
+    dest,
+    fmt,
+    quality=DEFAULT_IMAGE_QUALITY,
+    text=None,
+    icc_profile=None,
+    exif=None,
+):
+    options = {}
+    if icc_profile and icc_fits(icc_profile, image.mode, fmt):
+        options["icc_profile"] = icc_profile
+    if exif:
+        options["exif"] = exif
+
+    if fmt == "png":
+        info = PngInfo()
+        for key, value in (text or {}).items():
+            info.add_text(key, value)
+        image.save(dest, format="PNG", pnginfo=info, **options)
+    elif fmt == "webp":
+        image.save(
+            dest, format="WEBP", quality=quality, lossless=quality >= 100, **options
+        )
+    else:
+        image.save(
+            dest,
+            format="JPEG",
+            quality=quality,
+            subsampling=0 if quality >= 90 else -1,
+            **options,
+        )
 
 
 def _parse_fraction(text, fallback=0.0):
@@ -4096,6 +4885,11 @@ class GeneratePane:
         image_button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
         image_button_box.set_halign(Gtk.Align.CENTER)
 
+        self.upscale_image_button = Gtk.Button(label="Upscale Image")
+        self.upscale_image_button.connect("clicked", self.on_upscale_image_clicked)
+        self.upscale_image_button.set_sensitive(False)
+        image_button_box.pack_start(self.upscale_image_button, False, False, 0)
+
         self.delete_image_button = Gtk.Button(label="Delete Image")
         self.delete_image_button.connect("clicked", self.on_delete_image_clicked)
         self.delete_image_button.set_sensitive(False)
@@ -4851,7 +5645,7 @@ class GeneratePane:
         self.stop_button.hide()
         self.stop_button.set_sensitive(False)
         if self.current_image_path and not self.preview_shown:
-            self.delete_image_button.set_sensitive(True)
+            self._set_image_buttons(True)
         return False
 
     def _enable_load(self):
@@ -4897,7 +5691,7 @@ class GeneratePane:
         self.generate_button.hide()
         self.stop_button.set_sensitive(True)
         self.stop_button.show()
-        self.delete_image_button.set_sensitive(False)
+        self._set_image_buttons(False)
 
         self.generation_thread = threading.Thread(
             target=self.generate_image_thread, daemon=True
@@ -5239,7 +6033,7 @@ class GeneratePane:
             pixbuf = GdkPixbuf.Pixbuf.new_from_file(path)
             self.image_display.set_from_pixbuf(pixbuf)
             self.current_image_path = path
-            self.delete_image_button.set_sensitive(True)
+            self._set_image_buttons(True)
             self.window.show_output(self)
         except Exception as e:  # noqa: BLE001
             print(f"Error displaying image: {e}.", file=sys.stderr)
@@ -5248,7 +6042,15 @@ class GeneratePane:
     def _clear_image_display(self):
         self.image_display.clear()
         self.current_image_path = None
-        self.delete_image_button.set_sensitive(False)
+        self._set_image_buttons(False)
+
+    def _set_image_buttons(self, sensitive):
+        self.upscale_image_button.set_sensitive(sensitive)
+        self.delete_image_button.set_sensitive(sensitive)
+
+    def on_upscale_image_clicked(self, button):
+        if self.current_image_path:
+            self.window.send_to_upscaler(self.current_image_path)
 
     def on_delete_image_clicked(self, button):
         if self.current_image_path:
@@ -6311,8 +7113,25 @@ class ZImagePane(NativeZImagePane):
 
 class UpscalePane:
     name = "upscale"
-    mode_label = "Upscale"
+    mode_label = "Upscale Video"
     output_label = "Upscaled Frame"
+    piece = "frame"
+    seam_extra = " and shimmer between frames"
+
+    source_hint = "Choose a video to upscale."
+    source_placeholder = "Path to a video file"
+    presets = OUTPUT_PRESETS
+    default_preset = DEFAULT_PRESET
+    custom_size = (1280, 960)
+    size_step = 2
+    models = tuple((label, name) for label, name, _url in BUILTIN_MODELS)
+    default_model = DEFAULT_MODEL
+    browse_title = "Select a video"
+    source_filter = ("Video files", VIDEO_PATTERNS)
+    pick_many = False
+    default_tile = DEFAULT_TILE
+    tile_ceiling = 4096
+    save_dir = VIDEO_DIR
 
     def __init__(self, window):
         self.window = window
@@ -6344,12 +7163,18 @@ class UpscalePane:
         controls_box.set_border_width(10)
         scrolled.add(controls_box)
 
-        controls_box.pack_start(self._build_source_area(), False, False, 0)
-        controls_box.pack_start(self._build_output_row(), False, False, 0)
-        controls_box.pack_start(self._build_model_rows(), False, False, 0)
-        controls_box.pack_start(self._build_advanced(), False, False, 0)
+        for section in self._sections():
+            controls_box.pack_start(section, False, False, 0)
 
         return scrolled
+
+    def _sections(self):
+        return (
+            self._build_source_area(),
+            self._build_output_row(),
+            self._build_model_rows(),
+            self._build_advanced(),
+        )
 
     def shutdown(self):
         if self.working:
@@ -6366,7 +7191,7 @@ class UpscalePane:
         box.set_border_width(10)
         frame.add(box)
 
-        self.hint_label = Gtk.Label(label="Choose a video to upscale.")
+        self.hint_label = Gtk.Label(label=self.source_hint)
         box.pack_start(self.hint_label, False, False, 0)
 
         self.source_label = Gtk.Label(label="No file selected.")
@@ -6376,7 +7201,7 @@ class UpscalePane:
 
         path_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
         self.source_entry = Gtk.Entry()
-        self.source_entry.set_placeholder_text("Path to a video file")
+        self.source_entry.set_placeholder_text(self.source_placeholder)
         self.source_entry.connect("activate", self.on_source_entry_activate)
         path_box.pack_start(self.source_entry, True, True, 0)
 
@@ -6396,16 +7221,21 @@ class UpscalePane:
         box.pack_start(label, False, False, 0)
 
         self.preset_combo = Gtk.ComboBoxText()
-        for ident, text, _mode, _value in OUTPUT_PRESETS:
+        for ident, text, _mode, _value in self.presets:
             self.preset_combo.append(ident, text)
-        self.preset_combo.set_active_id(DEFAULT_PRESET)
+        self.preset_combo.set_active_id(self.default_preset)
         self.preset_combo.connect("changed", self.on_output_changed)
         box.pack_start(self.preset_combo, False, False, 0)
 
+        width, height = self.custom_size
         self.out_width_spin = Gtk.SpinButton()
         self.out_width_spin.set_adjustment(
             Gtk.Adjustment(
-                value=1280, lower=16, upper=16384, step_increment=2, page_increment=16
+                value=width,
+                lower=16,
+                upper=16384,
+                step_increment=self.size_step,
+                page_increment=16,
             )
         )
         self.out_width_spin.set_size_request(90, -1)
@@ -6418,7 +7248,11 @@ class UpscalePane:
         self.out_height_spin = Gtk.SpinButton()
         self.out_height_spin.set_adjustment(
             Gtk.Adjustment(
-                value=960, lower=16, upper=16384, step_increment=2, page_increment=16
+                value=height,
+                lower=16,
+                upper=16384,
+                step_increment=self.size_step,
+                page_increment=16,
             )
         )
         self.out_height_spin.set_size_request(90, -1)
@@ -6441,10 +7275,10 @@ class UpscalePane:
         model_box.pack_start(label, False, False, 0)
 
         self.model_combo = Gtk.ComboBoxText()
-        for text, filename, _url in BUILTIN_MODELS:
-            self.model_combo.append(filename, text)
+        for text, ident in self.models:
+            self.model_combo.append(ident, text)
         self.model_combo.append(CUSTOM_MODEL_ID, "Custom weights...")
-        self.model_combo.set_active_id(DEFAULT_MODEL)
+        self.model_combo.set_active_id(self.default_model)
         self.model_combo.connect("changed", self.on_model_changed)
         model_box.pack_start(self.model_combo, False, False, 0)
 
@@ -6461,7 +7295,8 @@ class UpscalePane:
 
         self.model_entry = Gtk.Entry()
         self.model_entry.set_placeholder_text(
-            "A .pth or .safetensors SPAN / Real-ESRGAN / ESRGAN checkpoint"
+            "A .pth or .safetensors Real-CUGAN / Real-ESRGAN / ESRGAN / SPAN "
+            "checkpoint"
         )
         custom_box.pack_start(self.model_entry, True, True, 0)
 
@@ -6490,41 +7325,8 @@ class UpscalePane:
         return spin
 
     def _build_advanced(self):
-        expander = Gtk.Expander(label="Advanced")
-        grid = Gtk.Grid(row_spacing=6, column_spacing=8)
-        grid.set_border_width(10)
-        expander.add(grid)
-
-        row = 0
-
-        grid.attach(self._label("Device:"), 0, row, 1, 1)
-        self.device_combo = Gtk.ComboBoxText()
-        for device in available_devices():
-            self.device_combo.append(device, describe_device(device))
-        self.device_combo.set_active_id(preferred_device())
-        self.device_combo.connect("changed", self.on_device_changed)
-        grid.attach(self.device_combo, 1, row, 2, 1)
-
-        grid.attach(self._label("Threads:"), 3, row, 1, 1)
-        self.threads_spin = self._spin(
-            min(os.cpu_count() or 4, 64), 1, 256, 1, 4, width=80
-        )
-        grid.attach(self.threads_spin, 4, row, 1, 1)
-        row += 1
-
-        grid.attach(self._label("Tile:"), 0, row, 1, 1)
-        self.tile_spin = self._spin(DEFAULT_TILE, 0, 4096, 32, 128, width=90)
-        self.tile_spin.connect("value-changed", self._note_user_choice, "tile")
-        grid.attach(self.tile_spin, 1, row, 1, 1)
-
-        grid.attach(self._label("Overlap:"), 2, row, 1, 1)
-        self.tile_pad_spin = self._spin(DEFAULT_TILE_PAD, 0, 256, 4, 16, width=80)
-        grid.attach(self.tile_pad_spin, 3, row, 1, 1)
-
-        self.channels_last_check = Gtk.CheckButton(label="channels_last")
-        self.channels_last_check.set_active(True)
-        grid.attach(self.channels_last_check, 4, row, 1, 1)
-        row += 1
+        expander, grid = self._advanced_grid()
+        row = self._attach_runtime_rows(grid, 0)
 
         grid.attach(self._label("Source filters:"), 0, row, 1, 1)
         self.deinterlace_check = Gtk.CheckButton(label="Deinterlace (yadif)")
@@ -6534,14 +7336,7 @@ class UpscalePane:
         grid.attach(self.compile_check, 3, row, 2, 1)
         row += 1
 
-        grid.attach(self._label("Precision:"), 0, row, 1, 1)
-        self.precision_combo = Gtk.ComboBoxText()
-        for ident, text in PRECISIONS:
-            self.precision_combo.append(ident, text)
-        self.precision_combo.set_active_id(DEFAULT_PRECISION)
-        self.precision_combo.connect("changed", self._note_user_choice, "precision")
-        grid.attach(self.precision_combo, 1, row, 2, 1)
-        row += 1
+        row = self._attach_precision_row(grid, row)
 
         grid.attach(self._label("Extra -vf before:"), 0, row, 1, 1)
         self.filters_pre_entry = Gtk.Entry()
@@ -6596,16 +7391,68 @@ class UpscalePane:
         grid.attach(self.limit_spin, 5, row, 1, 1)
         row += 1
 
+        self._attach_save_row(grid, row)
+        return expander
+
+    def _advanced_grid(self):
+        expander = Gtk.Expander(label="Advanced")
+        grid = Gtk.Grid(row_spacing=6, column_spacing=8)
+        grid.set_border_width(10)
+        expander.add(grid)
+        return expander, grid
+
+    def _attach_runtime_rows(self, grid, row):
+        grid.attach(self._label("Device:"), 0, row, 1, 1)
+        self.device_combo = Gtk.ComboBoxText()
+        for device in available_devices():
+            self.device_combo.append(device, describe_device(device))
+        self.device_combo.set_active_id(preferred_device())
+        self.device_combo.connect("changed", self.on_device_changed)
+        grid.attach(self.device_combo, 1, row, 2, 1)
+
+        grid.attach(self._label("Threads:"), 3, row, 1, 1)
+        self.threads_spin = self._spin(
+            min(os.cpu_count() or 4, 64), 1, 256, 1, 4, width=80
+        )
+        grid.attach(self.threads_spin, 4, row, 1, 1)
+        row += 1
+
+        grid.attach(self._label("Tile:"), 0, row, 1, 1)
+        self.tile_spin = self._spin(
+            self.default_tile, 0, self.tile_ceiling, 32, 128, width=90
+        )
+        self.tile_spin.connect("value-changed", self._note_user_choice, "tile")
+        grid.attach(self.tile_spin, 1, row, 1, 1)
+
+        grid.attach(self._label("Overlap:"), 2, row, 1, 1)
+        self.tile_pad_spin = self._spin(DEFAULT_TILE_PAD, 0, 256, 4, 16, width=80)
+        grid.attach(self.tile_pad_spin, 3, row, 1, 1)
+
+        self.channels_last_check = Gtk.CheckButton(label="channels_last")
+        self.channels_last_check.set_active(True)
+        grid.attach(self.channels_last_check, 4, row, 1, 1)
+        return row + 1
+
+    def _attach_precision_row(self, grid, row):
+        grid.attach(self._label("Precision:"), 0, row, 1, 1)
+        self.precision_combo = Gtk.ComboBoxText()
+        for ident, text in PRECISIONS:
+            self.precision_combo.append(ident, text)
+        self.precision_combo.set_active_id(DEFAULT_PRECISION)
+        self.precision_combo.connect("changed", self._note_user_choice, "precision")
+        grid.attach(self.precision_combo, 1, row, 2, 1)
+        return row + 1
+
+    def _attach_save_row(self, grid, row):
         grid.attach(self._label("Save to:"), 0, row, 1, 1)
         self.output_entry = Gtk.Entry()
-        self.output_entry.set_text(str(VIDEO_DIR))
+        self.output_entry.set_text(str(self.save_dir))
         grid.attach(self.output_entry, 1, row, 4, 1)
 
         output_browse = Gtk.Button(label="Browse...")
         output_browse.connect("clicked", self.on_browse_output_dir)
         grid.attach(output_browse, 5, row, 1, 1)
-
-        return expander
+        return row + 1
 
     def _label(self, text):
         label = Gtk.Label(label=text)
@@ -6673,65 +7520,8 @@ class UpscalePane:
     def load_settings(self, settings):
         self._loading_settings = True
         try:
-            if settings.get("preset") in [p[0] for p in OUTPUT_PRESETS]:
-                self.preset_combo.set_active_id(settings["preset"])
-            if "out_width" in settings:
-                self.out_width_spin.set_value(settings["out_width"])
-            if "out_height" in settings:
-                self.out_height_spin.set_value(settings["out_height"])
-
-            model = settings.get("model")
-            if model:
-                known = [m[1] for m in BUILTIN_MODELS] + [CUSTOM_MODEL_ID]
-                if model in known:
-                    self.model_combo.set_active_id(model)
-            if "model_path" in settings:
-                self.model_entry.set_text(settings["model_path"])
-
-            device = settings.get("device")
-            if device and self.device_combo.set_active_id(device) is False:
-                self.device_combo.set_active_id("cpu")
-
-            for key, spin in (
-                ("threads", self.threads_spin),
-                ("tile", self.tile_spin),
-                ("tile_pad", self.tile_pad_spin),
-                ("crf", self.crf_spin),
-                ("start", self.start_spin),
-                ("limit", self.limit_spin),
-            ):
-                if key in settings:
-                    spin.set_value(settings[key])
-
-            for key, check in (
-                ("channels_last", self.channels_last_check),
-                ("deinterlace", self.deinterlace_check),
-                ("compile", self.compile_check),
-            ):
-                if key in settings:
-                    check.set_active(bool(settings[key]))
-
-            if settings.get("precision") in PRECISION_DTYPES:
-                self.precision_combo.set_active_id(settings["precision"])
-
-            for key, entry in (
-                ("filters", self.filters_pre_entry),
-                ("filters_pre", self.filters_pre_entry),
-                ("filters_post", self.filters_post_entry),
-            ):
-                if key in settings:
-                    entry.set_text(settings[key])
-
-            if settings.get("encoder") in [e[0] for e in ENCODERS]:
-                self.encoder_combo.set_active_id(settings["encoder"])
-            if settings.get("encoder_preset") in X264_PRESETS:
-                self.preset_encoder_combo.set_active_id(settings["encoder_preset"])
-            if settings.get("container") in dict(CONTAINERS):
-                self.container_combo.set_active_id(settings["container"])
-            if settings.get("audio") in [a[0] for a in AUDIO_MODES]:
-                self.audio_combo.set_active_id(settings["audio"])
-            if settings.get("output_dir"):
-                self.output_entry.set_text(settings["output_dir"])
+            self._load_shared(settings)
+            self._load_own(settings)
         except Exception as e:  # noqa: BLE001
             print(f"Error loading settings: {e}.")
         finally:
@@ -6742,17 +7532,87 @@ class UpscalePane:
             automatic = self._auto_knobs()
             self._user_set.update(key for key in remembered if key in automatic)
 
+        self._settings_loaded()
+
+    def _load_shared(self, settings):
+        if settings.get("preset") in [p[0] for p in self.presets]:
+            self.preset_combo.set_active_id(settings["preset"])
+
+        model = settings.get("model")
+        if model in [ident for _label, ident in self.models] + [CUSTOM_MODEL_ID]:
+            self.model_combo.set_active_id(model)
+        if "model_path" in settings:
+            self.model_entry.set_text(settings["model_path"])
+
+        device = settings.get("device")
+        if device and self.device_combo.set_active_id(device) is False:
+            self.device_combo.set_active_id("cpu")
+
+        for key, spin in (
+            ("out_width", self.out_width_spin),
+            ("out_height", self.out_height_spin),
+            ("threads", self.threads_spin),
+            ("tile", self.tile_spin),
+            ("tile_pad", self.tile_pad_spin),
+        ):
+            if key in settings:
+                spin.set_value(settings[key])
+
+        if "channels_last" in settings:
+            self.channels_last_check.set_active(bool(settings["channels_last"]))
+        if settings.get("precision") in PRECISION_DTYPES:
+            self.precision_combo.set_active_id(settings["precision"])
+        if settings.get("output_dir"):
+            self.output_entry.set_text(settings["output_dir"])
+
+    def _load_own(self, settings):
+        for key, spin in (
+            ("crf", self.crf_spin),
+            ("start", self.start_spin),
+            ("limit", self.limit_spin),
+        ):
+            if key in settings:
+                spin.set_value(settings[key])
+
+        for key, check in (
+            ("deinterlace", self.deinterlace_check),
+            ("compile", self.compile_check),
+        ):
+            if key in settings:
+                check.set_active(bool(settings[key]))
+
+        for key, entry in (
+            ("filters", self.filters_pre_entry),
+            ("filters_pre", self.filters_pre_entry),
+            ("filters_post", self.filters_post_entry),
+        ):
+            if key in settings:
+                entry.set_text(settings[key])
+
+        if settings.get("encoder") in [e[0] for e in ENCODERS]:
+            self.encoder_combo.set_active_id(settings["encoder"])
+        if settings.get("encoder_preset") in X264_PRESETS:
+            self.preset_encoder_combo.set_active_id(settings["encoder_preset"])
+        if settings.get("container") in dict(CONTAINERS):
+            self.container_combo.set_active_id(settings["container"])
+        if settings.get("audio") in [a[0] for a in AUDIO_MODES]:
+            self.audio_combo.set_active_id(settings["audio"])
+
+    def _settings_loaded(self):
         self.on_model_changed()
         self.on_encoder_changed()
         self.on_output_changed()
         self.on_device_changed()
 
     def collect_settings(self):
+        return {**self._collect_shared(), **self._collect_own()}
+
+    def _collect_shared(self):
         return {
-            "preset": self.preset_combo.get_active_id() or DEFAULT_PRESET,
+            "preset": self.preset_combo.get_active_id() or self.default_preset,
             "out_width": int(self.out_width_spin.get_value()),
             "out_height": int(self.out_height_spin.get_value()),
-            "model": self.model_combo.get_active_id() or DEFAULT_MODEL,
+            "model": self.model_combo.get_active_id() or self.default_model,
             "model_path": self.model_entry.get_text(),
             "device": self.device_combo.get_active_id() or "cpu",
             "threads": int(self.threads_spin.get_value()),
@@ -6760,9 +7620,14 @@ class UpscalePane:
             "tile_pad": int(self.tile_pad_spin.get_value()),
             "user_set": sorted(self._user_set),
             "channels_last": self.channels_last_check.get_active(),
+            "precision": (self.precision_combo.get_active_id() or DEFAULT_PRECISION),
+            "output_dir": self.output_entry.get_text(),
+        }
+
+    def _collect_own(self):
+        return {
             "deinterlace": self.deinterlace_check.get_active(),
             "compile": self.compile_check.get_active(),
-            "precision": (self.precision_combo.get_active_id() or DEFAULT_PRECISION),
             "filters_pre": self.filters_pre_entry.get_text(),
             "filters_post": self.filters_post_entry.get_text(),
             "encoder": self.encoder_combo.get_active_id() or DEFAULT_ENCODER,
@@ -6774,7 +7639,6 @@ class UpscalePane:
             "audio": self.audio_combo.get_active_id() or DEFAULT_AUDIO,
             "start": spin_value(self.start_spin),
             "limit": spin_value(self.limit_spin),
-            "output_dir": self.output_entry.get_text(),
         }
 
     def on_source_entry_activate(self, entry):
@@ -6784,7 +7648,7 @@ class UpscalePane:
 
     def on_browse_source(self, button):
         dialog = Gtk.FileChooserDialog(
-            title="Select a video",
+            title=self.browse_title,
             parent=self.window,
             action=Gtk.FileChooserAction.OPEN,
         )
@@ -6794,13 +7658,15 @@ class UpscalePane:
             Gtk.STOCK_OPEN,
             Gtk.ResponseType.OK,
         )
+        dialog.set_select_multiple(self.pick_many)
 
-        video_filter = Gtk.FileFilter()
-        video_filter.set_name("Video files")
-        for pattern in VIDEO_PATTERNS:
-            video_filter.add_pattern(pattern)
-            video_filter.add_pattern(pattern.upper())
-        dialog.add_filter(video_filter)
+        name, patterns = self.source_filter
+        source_filter = Gtk.FileFilter()
+        source_filter.set_name(name)
+        for pattern in patterns:
+            source_filter.add_pattern(pattern)
+            source_filter.add_pattern(pattern.upper())
+        dialog.add_filter(source_filter)
 
         all_filter = Gtk.FileFilter()
         all_filter.set_name("All files")
@@ -6808,10 +7674,10 @@ class UpscalePane:
         dialog.add_filter(all_filter)
 
         if dialog.run() == Gtk.ResponseType.OK:
-            selected = dialog.get_filename()
+            selected = [path for path in dialog.get_filenames() if path]
             if selected:
                 dialog.destroy()
-                self.set_source(selected)
+                self.set_source(selected if self.pick_many else selected[0])
                 return
 
         dialog.destroy()
@@ -6893,26 +7759,23 @@ class UpscalePane:
         )
 
     def on_model_changed(self, widget=None):
-        model = self.model_combo.get_active_id() or DEFAULT_MODEL
-        custom = model == CUSTOM_MODEL_ID
-        self.custom_model_box.set_sensitive(custom)
+        model = self.model_combo.get_active_id() or self.default_model
+        self.custom_model_box.set_sensitive(model == CUSTOM_MODEL_ID)
         self._apply_auto_knobs()
+        self.model_note.set_text(self._model_note(model))
 
-        if custom:
-            self.model_note.set_text("Bring your own checkpoint.")
-            return
+    def _model_note(self, model):
+        if model == CUSTOM_MODEL_ID:
+            return "Bring your own checkpoint."
 
         local = UPSCALER_DIR / model
         if local.exists():
-            self.model_note.set_text(
-                f"{_format_size(local.stat().st_size)} in {UPSCALER_DIR}"
-            )
-        else:
-            self.model_note.set_text("Will be downloaded on first use.")
+            return f"{_format_size(local.stat().st_size)} in {UPSCALER_DIR}"
+        return "Will be downloaded on first use."
 
     def _auto_knobs(self):
         gpu = (self.device_combo.get_active_id() or "cpu").startswith("ncnn:")
-        heavy = (self.model_combo.get_active_id() or DEFAULT_MODEL) in HEAVY_MODELS
+        heavy = (self.model_combo.get_active_id() or self.default_model) in HEAVY_MODELS
         return {
             "tile": 0 if gpu and not heavy else DEFAULT_TILE,
             "precision": "float16" if gpu else DEFAULT_PRECISION,
@@ -7010,17 +7873,23 @@ class UpscalePane:
         update_status("Settings restored to defaults.")
 
     def _restore_defaults(self):
-        self.preset_combo.set_active_id(DEFAULT_PRESET)
-        self.model_combo.set_active_id(DEFAULT_MODEL)
+        self.preset_combo.set_active_id(self.default_preset)
+        self.out_width_spin.set_value(self.custom_size[0])
+        self.out_height_spin.set_value(self.custom_size[1])
+        self.model_combo.set_active_id(self.default_model)
         self.model_entry.set_text("")
         self.device_combo.set_active_id(preferred_device())
         self.threads_spin.set_value(min(os.cpu_count() or 4, 64))
-        self.tile_spin.set_value(DEFAULT_TILE)
+        self.tile_spin.set_value(self.default_tile)
         self.tile_pad_spin.set_value(DEFAULT_TILE_PAD)
         self.channels_last_check.set_active(True)
+        self.precision_combo.set_active_id(DEFAULT_PRECISION)
+        self.output_entry.set_text(str(self.save_dir))
+        self._restore_own()
+
+    def _restore_own(self):
         self.deinterlace_check.set_active(False)
         self.compile_check.set_active(False)
-        self.precision_combo.set_active_id(DEFAULT_PRECISION)
         self.filters_pre_entry.set_text("")
         self.filters_post_entry.set_text("")
         self.encoder_combo.set_active_id(DEFAULT_ENCODER)
@@ -7030,7 +7899,6 @@ class UpscalePane:
         self.audio_combo.set_active_id(DEFAULT_AUDIO)
         self.start_spin.set_value(0)
         self.limit_spin.set_value(0)
-        self.output_entry.set_text(str(VIDEO_DIR))
 
     def _collect_job(self):
         info = self.source
@@ -7055,7 +7923,7 @@ class UpscalePane:
             model_url = None
         else:
             model_path = UPSCALER_DIR / model_id
-            model_url = next(u for _label, f, u in BUILTIN_MODELS if f == model_id)
+            model_url = weights_url(model_id)
 
         encoder = self.encoder_combo.get_active_id() or DEFAULT_ENCODER
         container = self.container_combo.get_active_id() or DEFAULT_CONTAINER
@@ -7071,28 +7939,7 @@ class UpscalePane:
 
         device = self.device_combo.get_active_id() or "cpu"
         precision = self.precision_combo.get_active_id() or DEFAULT_PRECISION
-        if device.startswith("ncnn:") and precision == "bfloat16":
-            print(
-                "ncnn's Vulkan path has no bfloat16 here. Using float16, "
-                "which is what a GPU wants anyway."
-            )
-        if device == "cpu" and precision == "bfloat16":
-            if BF16_IN_HARDWARE:
-                print(
-                    "This CPU has bfloat16 instructions (AMX or AVX512-BF16), "
-                    "so this should be a real speedup."
-                )
-            else:
-                print(
-                    "This CPU has no bfloat16 instructions, so torch will "
-                    "emulate it and it will most likely be slower than "
-                    "float32."
-                )
-        elif device == "cpu" and precision == "float16":
-            print(
-                "float16 exists for GPUs. On a CPU it is emulated and slower "
-                "than float32."
-            )
+        self._note_precision(device, precision)
 
         return {
             "info": info,
@@ -7120,6 +7967,57 @@ class UpscalePane:
             "limit": spin_value(self.limit_spin),
             "dest": dest,
         }
+
+    def _settle_overlap(self, model, tile, tile_pad, min_overlap, whole_ok=True):
+        if tile <= 0:
+            return tile_pad
+        if hasattr(model, "upscale_tiled"):
+            update_status(
+                f"Real-CUGAN averages over the whole {self.piece}, so its tiles "
+                "first agree on those averages and come out the same as one piece."
+            )
+            return tile_pad
+        if tile_pad >= min_overlap:
+            return tile_pad
+        if min_overlap * 2 <= tile:
+            update_status(
+                f"Raised the tile overlap to {min_overlap} px, the radius this "
+                f"network actually reads. Tiled output now matches whole-{self.piece} "
+                "output exactly."
+            )
+            return min_overlap
+        advice = f"Set Tile to 0 to process whole {self.piece}s, or raise"
+        update_status(
+            f"Note: this network reads {min_overlap} px around every output "
+            f"pixel but the tiles only carry {tile_pad} px of context, so tile "
+            f"seams may show{self.seam_extra}. {advice if whole_ok else 'Raise'} "
+            "Tile and Overlap if there is memory for it."
+        )
+        return tile_pad
+
+    def _note_precision(self, device, precision):
+        if device.startswith("ncnn:") and precision == "bfloat16":
+            print(
+                "ncnn's Vulkan path has no bfloat16 here. Using float16, "
+                "which is what a GPU wants anyway."
+            )
+        if device == "cpu" and precision == "bfloat16":
+            if BF16_IN_HARDWARE:
+                print(
+                    "This CPU has bfloat16 instructions (AMX or AVX512-BF16), "
+                    "so this should be a real speedup."
+                )
+            else:
+                print(
+                    "This CPU has no bfloat16 instructions, so torch will "
+                    "emulate it and it will most likely be slower than "
+                    "float32."
+                )
+        elif device == "cpu" and precision == "float16":
+            print(
+                "float16 exists for GPUs. On a CPU it is emulated and slower "
+                "than float32."
+            )
 
     def on_start_clicked(self, button):
         if self.working or self.source is None or not self.window.claim(self):
@@ -7229,48 +8127,39 @@ class UpscalePane:
             if not model_path.exists():
                 if not job["model_url"]:
                     raise FileNotFoundError(f"No such weights file: {model_path}")
-                update_status(f"Downloading {model_path.name}...")
-                download_model(
-                    job["model_url"],
+                fetch_weights(
                     model_path,
                     progress=self._download_progress,
                     stop_check=self.stop_event.is_set,
                 )
-                update_status(f"Saved {model_path}.")
-                terms = MODEL_LICENSES.get(model_path.name)
-                if terms:
-                    update_status(f"{model_path.name} is under {terms}.")
 
             update_status(f"Loading {model_path.name}...")
-            on_ncnn = job["device"].startswith("ncnn:")
-            if on_ncnn:
-                loaded = load_ncnn_upscaler(
-                    model_path,
-                    gpu=int(job["device"].partition(":")[2] or 0),
-                    threads=job["threads"],
-                    fp16=job["dtype"] is not torch.float32,
-                )
-            else:
-                loaded = load_upscaler(
-                    model_path,
-                    device=job["device"],
-                    channels_last=job["channels_last"],
-                    dtype=job["dtype"],
-                )
+            loaded, torch_device, torch_dtype = open_upscaler(
+                model_path,
+                job["device"],
+                threads=job["threads"],
+                dtype=job["dtype"],
+                channels_last=job["channels_last"],
+            )
             model, native_scale, size_multiple, min_overlap, description = loaded
 
-            torch_device = "cpu" if on_ncnn else job["device"]
-            torch_dtype = torch.float32 if on_ncnn else job["dtype"]
+            on_ncnn = isinstance(model, NcnnUpscaler)
+            heavy = is_heavy(model)
             channels_last = False if on_ncnn else job["channels_last"]
             if on_ncnn:
                 update_status(f"{description}.")
             else:
                 update_status(
-                    f"{description}, running on {job['device']} in "
+                    f"{description}, running on {torch_device} in "
                     f"{str(torch_dtype).replace('torch.', '')}."
                 )
 
-            if job["compile"] and not on_ncnn:
+            if job["compile"] and hasattr(model, "upscale_tiled"):
+                update_status(
+                    "torch.compile is left out for Real-CUGAN, which runs its "
+                    "own tiles around the network."
+                )
+            elif job["compile"] and not on_ncnn:
                 update_status(
                     "Compiling with torch.compile. The first few frames pay "
                     "for it so the rest should be faster."
@@ -7284,29 +8173,21 @@ class UpscalePane:
                     )
 
             tile = job["tile"]
-            tile_pad = job["tile_pad"]
-            if tile > 0 and tile_pad < min_overlap:
-                if min_overlap * 2 <= tile:
-                    tile_pad = min_overlap
-                    update_status(
-                        f"Raised the tile overlap to {tile_pad} px, the radius "
-                        "this network actually reads. Tiled output now matches "
-                        "whole-frame output exactly."
-                    )
-                else:
-                    update_status(
-                        f"Note: this network reads {min_overlap} px around every "
-                        f"output pixel but the tiles only carry {tile_pad} px of "
-                        "context, so tile seams may show and shimmer between "
-                        "frames. Set Tile to 0 to process whole frames, or raise "
-                        "Tile and Overlap if there is memory for it."
-                    )
+            if tile <= 0 and on_ncnn and heavy:
+                tile = DEFAULT_TILE
+                update_status(
+                    f"{description} is too heavy for whole frames on a GPU, so "
+                    f"it works in {tile} px tiles."
+                )
+            tile_pad = self._settle_overlap(
+                model, tile, job["tile_pad"], min_overlap, not (on_ncnn and heavy)
+            )
 
             if tile > 0:
                 update_status(
                     f"Working in {tile} px tiles with {tile_pad} px of overlap."
                 )
-                if on_ncnn and model_path.name not in HEAVY_MODELS:
+                if on_ncnn and not heavy:
                     update_status(
                         "On a GPU that is usually the wrong trade. Every tile "
                         "is a separate upload, dispatch and download, and the "
@@ -7581,6 +8462,731 @@ class UpscalePane:
         )
         self.on_model_changed()
         return False
+
+
+class ImageUpscalePane(UpscalePane):
+    name = "upscale_image"
+    mode_label = "Upscale Image"
+    output_label = "Upscaled Image"
+
+    source_hint = "Choose images, or a folder of them, to upscale."
+    source_placeholder = "Path to an image or a folder of images"
+    presets = IMAGE_PRESETS
+    default_preset = DEFAULT_IMAGE_PRESET
+    custom_size = (2048, 2048)
+    size_step = 1
+    models = IMAGE_MODELS
+    default_model = DEFAULT_IMAGE_MODEL
+    browse_title = "Select images"
+    source_filter = ("Images", IMAGE_PATTERNS)
+    pick_many = True
+    default_tile = 0
+    tile_ceiling = 8192
+    save_dir = IMAGE_DIR
+    piece = "image"
+    seam_extra = ""
+
+    def __init__(self, window):
+        super().__init__(window)
+        self.sources = []
+        self._first_size = None
+        self._pixbufs = {}
+        self._shown_note = ""
+
+    def _sections(self):
+        return (
+            self._build_source_area(),
+            self._build_output_row(),
+            self._build_model_rows(),
+            self._build_format_row(),
+            self._build_advanced(),
+        )
+
+    def _build_model_rows(self):
+        box = super()._build_model_rows()
+
+        level_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        label = Gtk.Label(label="Denoise:")
+        label.set_size_request(100, -1)
+        label.set_xalign(0)
+        level_box.pack_start(label, False, False, 0)
+
+        self.level_combo = Gtk.ComboBoxText()
+        for ident, text in CUGAN_LEVELS:
+            self.level_combo.append(ident, text)
+        self.level_combo.set_active_id(DEFAULT_CUGAN_LEVEL)
+        self.level_combo.connect("changed", self.on_level_changed)
+        level_box.pack_start(self.level_combo, False, False, 0)
+
+        self.level_note = Gtk.Label(label="")
+        self.level_note.set_xalign(0)
+        level_box.pack_start(self.level_note, True, True, 6)
+
+        self.level_box = level_box
+        box.pack_start(level_box, False, False, 0)
+        return box
+
+    def _build_format_row(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        label = Gtk.Label(label="Save as:")
+        label.set_size_request(100, -1)
+        label.set_xalign(0)
+        box.pack_start(label, False, False, 0)
+
+        self.format_combo = Gtk.ComboBoxText()
+        for ident, text in IMAGE_FORMATS:
+            self.format_combo.append(ident, text)
+        self.format_combo.set_active_id(DEFAULT_IMAGE_FORMAT)
+        self.format_combo.connect("changed", self.on_format_changed)
+        box.pack_start(self.format_combo, False, False, 0)
+
+        box.pack_start(self._label("Quality:"), False, False, 6)
+        self.quality_spin = self._spin(DEFAULT_IMAGE_QUALITY, 1, 100, 1, 5, width=80)
+        box.pack_start(self.quality_spin, False, False, 0)
+
+        self.format_note = Gtk.Label(label="")
+        self.format_note.set_xalign(0)
+        box.pack_start(self.format_note, True, True, 6)
+
+        return box
+
+    def _build_advanced(self):
+        expander, grid = self._advanced_grid()
+        row = self._attach_runtime_rows(grid, 0)
+        row = self._attach_precision_row(grid, row)
+        self._attach_save_row(grid, row)
+        return expander
+
+    def build_output_page(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        bar.set_border_width(5)
+        self.compare_button = Gtk.ToggleButton(label="Compare with Plain Resize")
+        self.compare_button.set_sensitive(False)
+        self.compare_button.connect("toggled", self.on_compare_toggled)
+        bar.pack_start(self.compare_button, False, False, 0)
+
+        self.result_note = Gtk.Label(label="The upscaled image appears here.")
+        self.result_note.set_xalign(0)
+        self.result_note.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+        bar.pack_start(self.result_note, True, True, 0)
+        page.pack_start(bar, False, False, 0)
+
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        self.result_image = Gtk.Image()
+        scrolled.add(self.result_image)
+        page.pack_start(scrolled, True, True, 0)
+
+        return page
+
+    def _load_own(self, settings):
+        if settings.get("level") in dict(CUGAN_LEVELS):
+            self.level_combo.set_active_id(settings["level"])
+        if settings.get("format") in dict(IMAGE_FORMATS):
+            self.format_combo.set_active_id(settings["format"])
+        if "quality" in settings:
+            self.quality_spin.set_value(settings["quality"])
+
+    def _settings_loaded(self):
+        self.on_model_changed()
+        self.on_format_changed()
+        self.on_output_changed()
+        self.on_device_changed()
+
+    def _collect_own(self):
+        return {
+            "level": self.level_combo.get_active_id() or DEFAULT_CUGAN_LEVEL,
+            "format": self.format_combo.get_active_id() or DEFAULT_IMAGE_FORMAT,
+            "quality": int(self.quality_spin.get_value()),
+        }
+
+    def _restore_own(self):
+        self.level_combo.set_active_id(DEFAULT_CUGAN_LEVEL)
+        self.format_combo.set_active_id(DEFAULT_IMAGE_FORMAT)
+        self.quality_spin.set_value(DEFAULT_IMAGE_QUALITY)
+
+    @staticmethod
+    def _split_paths(text):
+        text = text.strip()
+        if not text or Path(text).expanduser().exists():
+            return [text] if text else []
+        try:
+            return shlex.split(text)
+        except ValueError:
+            return [text]
+
+    def set_source(self, paths):
+        if isinstance(paths, (str, Path)):
+            paths = self._split_paths(str(paths))
+        found, missing = gather_images(paths)
+        for path in missing:
+            print(f"Not a file or a folder: {path}")
+
+        shown = [str(Path(path).expanduser()) for path in paths]
+        self.source_entry.set_text(shown[0] if len(shown) == 1 else shlex.join(shown))
+
+        self.sources = found
+        self.source = found or None
+        self._first_size = None
+
+        if not found:
+            self.source_label.set_text("No images found there." if paths else "")
+            self.hint_label.set_text(self.source_hint)
+            self.start_button.set_sensitive(False)
+            self.on_output_changed()
+            return
+
+        first = details = None
+        for candidate in found:
+            try:
+                details = self._describe(candidate)
+            except Exception as e:  # noqa: BLE001
+                print(f"Could not read {candidate.name}: {e}")
+                continue
+            first = candidate
+            break
+
+        if first is None:
+            self.source = None
+            self.sources = []
+            self.source_label.set_text(
+                "None of these could be read as an image."
+                if len(found) > 1
+                else f"{found[0].name} could not be read as an image."
+            )
+            self.start_button.set_sensitive(False)
+            self.on_output_changed()
+            return
+
+        self._first_size = details.pop(0)
+        if len(found) == 1:
+            text = f"{first.name}\n" + "  |  ".join(details)
+        else:
+            names = ", ".join(path.name for path in found[:3])
+            if len(found) > 3:
+                names += f" and {len(found) - 3} more"
+            text = f"{len(found)} images: {names}\nThe first is " + "  |  ".join(
+                details
+            )
+        self.source_label.set_text(text)
+        self.hint_label.set_text("Ready.")
+        self.start_button.set_sensitive(not self.working)
+        self.on_output_changed()
+        self._show_source(first)
+
+    @staticmethod
+    def _describe(path):
+        with _PILImage.open(path) as opened:
+            width, height = opened.size
+            if opened.getexif().get(EXIF_ORIENTATION, 1) in (5, 6, 7, 8):
+                width, height = height, width
+            details = [(width, height), f"{width}x{height}", opened.format or "?"]
+            details.append(opened.mode)
+            if "A" in opened.getbands() or "transparency" in opened.info:
+                details.append("transparency")
+            frames = getattr(opened, "n_frames", 1)
+            if frames > 1:
+                details.append(f"{frames} frames, the first is used")
+        return details
+
+    def _show_source(self, path):
+        self._pixbufs = {}
+        self.compare_button.set_active(False)
+        self.compare_button.set_sensitive(False)
+        try:
+            _info, width, height = GdkPixbuf.Pixbuf.get_file_info(str(path))
+            if max(width, height) > RESULT_DISPLAY_LIMIT:
+                pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(
+                    str(path), RESULT_DISPLAY_LIMIT, RESULT_DISPLAY_LIMIT, True
+                )
+            else:
+                pixbuf = GdkPixbuf.Pixbuf.new_from_file(str(path))
+            pixbuf = pixbuf.apply_embedded_orientation() or pixbuf
+        except Exception as e:  # noqa: BLE001
+            print(f"Could not show {path.name}: {e}.", file=sys.stderr)
+            self.result_image.clear()
+            self.result_note.set_text("The upscaled image appears here.")
+            return
+
+        self.result_image.set_from_pixbuf(pixbuf)
+        self.result_note.set_text(f"{path.name} as it is. Upscale it to compare.")
+        self.window.show_output(self)
+
+    def _cugan_scale(self):
+        preset = self.preset_combo.get_active_id() or self.default_preset
+        width, height = self._first_size or self.custom_size
+        target = image_target_size(
+            width,
+            height,
+            preset,
+            int(self.out_width_spin.get_value()),
+            int(self.out_height_spin.get_value()),
+        )
+        return pick_scale(CUGAN_SCALES, width, height, *target)
+
+    def on_output_changed(self, widget=None):
+        preset = self.preset_combo.get_active_id() or self.default_preset
+        custom = preset == "fit"
+        self.out_width_spin.set_sensitive(custom)
+        self.out_height_spin.set_sensitive(custom)
+        self.on_level_changed()
+
+        if self._first_size is None:
+            self.size_label.set_text("Waiting for an image.")
+            return
+
+        source_width, source_height = self._first_size
+        width, height = image_target_size(
+            source_width,
+            source_height,
+            preset,
+            int(self.out_width_spin.get_value()),
+            int(self.out_height_spin.get_value()),
+        )
+        text = (
+            f"{source_width}x{source_height}  ->  {width}x{height}  "
+            f"(x{width / max(source_width, 1):.2f})"
+        )
+        if len(self.sources) > 1:
+            text += f", for the first of {len(self.sources)}"
+        self.size_label.set_text(text)
+
+    def on_level_changed(self, widget=None):
+        level = self.level_combo.get_active_id() or DEFAULT_CUGAN_LEVEL
+        scale = self._cugan_scale()
+        if scale != 2 and level not in CUGAN_LEVELS_ABOVE_X2:
+            note = f"x{scale} only comes with the strong denoise, so that is used."
+        elif level == "conservative":
+            note = "Keeps the drawing, its texture and colors as they are."
+        elif level == "no-denoise":
+            note = "A little sharper. For clean images."
+        else:
+            note = "For JPEG artifacts and noise."
+        self.level_note.set_text(note)
+
+    def on_format_changed(self, widget=None):
+        fmt = self.format_combo.get_active_id() or DEFAULT_IMAGE_FORMAT
+        self.quality_spin.set_sensitive(fmt != "png")
+        self.format_note.set_text(
+            {
+                "png": "Keeps the prompt of a generated image.",
+                "webp": "Quality 100 is lossless.",
+                "jpg": "Transparent images are still saved as PNG.",
+            }[fmt]
+        )
+
+    def on_model_changed(self, widget=None):
+        super().on_model_changed(widget)
+        model = self.model_combo.get_active_id() or self.default_model
+        self.level_box.set_sensitive(model == REAL_CUGAN_ID)
+
+    def _model_note(self, model):
+        if model == CUSTOM_MODEL_ID:
+            return super()._model_note(model)
+
+        if model == REAL_CUGAN_ID:
+            folder = CUGAN_DIR
+            found = sorted(folder.glob("*.pth")) if folder.is_dir() else []
+        else:
+            folder = UPSCALER_DIR
+            names = IMAGE_FAMILIES.get(model, {}).values() or [model]
+            if model == GENERAL_BLEND_ID:
+                names = [f"{GENERAL_BLEND_ID}.pth"]
+            found = [folder / name for name in names if (folder / name).exists()]
+
+        if found:
+            size = _format_size(sum(path.stat().st_size for path in found))
+            note = f"{size} in {folder}"
+        else:
+            note = "Will be downloaded on first use."
+        if model == REAL_CUGAN_ID and (
+            self.device_combo.get_active_id() or "cpu"
+        ).startswith("ncnn:"):
+            note += " Runs on the CPU."
+        return note
+
+    def on_device_changed(self, widget=None):
+        super().on_device_changed(widget)
+        model = self.model_combo.get_active_id() or self.default_model
+        self.model_note.set_text(self._model_note(model))
+
+    def _auto_knobs(self):
+        model = self.model_combo.get_active_id() or self.default_model
+        device = self.device_combo.get_active_id() or "cpu"
+        gpu = device.startswith("ncnn:") and model != REAL_CUGAN_ID
+        return {
+            "tile": 0,
+            "precision": "float16" if gpu else DEFAULT_PRECISION,
+        }
+
+    def _collect_job(self):
+        if not self.sources:
+            return None
+
+        model_id = self.model_combo.get_active_id() or self.default_model
+        weights = None
+        if model_id == CUSTOM_MODEL_ID:
+            text = self.model_entry.get_text().strip()
+            if not text:
+                update_status("Choose a weights file first.")
+                return None
+            weights = Path(text).expanduser()
+
+        device = self.device_combo.get_active_id() or "cpu"
+        precision = self.precision_combo.get_active_id() or DEFAULT_PRECISION
+        self._note_precision(device, precision)
+
+        return {
+            "sources": list(self.sources),
+            "preset": self.preset_combo.get_active_id() or self.default_preset,
+            "out_width": int(self.out_width_spin.get_value()),
+            "out_height": int(self.out_height_spin.get_value()),
+            "model_id": model_id,
+            "weights": weights,
+            "level": self.level_combo.get_active_id() or DEFAULT_CUGAN_LEVEL,
+            "format": self.format_combo.get_active_id() or DEFAULT_IMAGE_FORMAT,
+            "quality": int(self.quality_spin.get_value()),
+            "device": device,
+            "dtype": PRECISION_DTYPES[precision],
+            "threads": int(self.threads_spin.get_value()),
+            "tile": int(self.tile_spin.get_value()),
+            "tile_pad": int(self.tile_pad_spin.get_value()),
+            "channels_last": self.channels_last_check.get_active(),
+            "output_dir": Path(
+                self.output_entry.get_text().strip() or str(IMAGE_DIR)
+            ).expanduser(),
+        }
+
+    def on_stop_clicked(self, button):
+        if not self.working:
+            return
+        self.stop_event.set()
+        update_status("Stopping. Images already finished stay saved.")
+
+    def on_delete_clicked(self, button):
+        target = self.current_output
+        super().on_delete_clicked(button)
+        if target is None or self.current_output is not None:
+            return
+        self._pixbufs = {}
+        self.compare_button.set_active(False)
+        self.compare_button.set_sensitive(False)
+        self.result_image.clear()
+        self.result_note.set_text(f"Deleted {Path(target).name}.")
+
+    def _open_network(self, job, weights):
+        if not weights.exists():
+            if job["model_id"] == CUSTOM_MODEL_ID:
+                raise FileNotFoundError(f"No such weights file: {weights}")
+            fetch_weights(
+                weights,
+                progress=self._download_progress,
+                stop_check=self.stop_event.is_set,
+            )
+
+        update_status(f"Loading {weights.name}...")
+        loaded, device, dtype = open_upscaler(
+            weights,
+            job["device"],
+            threads=job["threads"],
+            dtype=job["dtype"],
+            channels_last=job["channels_last"],
+        )
+        model, scale, size_multiple, min_overlap, description = loaded
+
+        on_ncnn = isinstance(model, NcnnUpscaler)
+        if on_ncnn:
+            update_status(f"{description}.")
+        else:
+            update_status(
+                f"{description}, running on {device} in "
+                f"{str(dtype).replace('torch.', '')}."
+            )
+
+        tile = job["tile"]
+        tile_pad = self._settle_overlap(model, tile, job["tile_pad"], min_overlap)
+
+        return {
+            "model": model,
+            "scale": scale,
+            "multiple": size_multiple,
+            "reach": min_overlap,
+            "tile": tile,
+            "tile_pad": tile_pad,
+            "runs_on": job["device"] if on_ncnn else device,
+            "device": device,
+            "dtype": dtype,
+            "channels_last": job["channels_last"] and not on_ncnn,
+            "description": f"{description} ({weights.name})",
+        }
+
+    def _tiles_for(self, network, width, height):
+        tile, tile_pad = network["tile"], network["tile_pad"]
+        spare = available_memory()
+        result = width * height * network["scale"] ** 2 * RESULT_BYTES_PER_PIXEL
+        if spare is not None and result > spare * MEMORY_SHARE:
+            raise MemoryError(
+                f"at x{network['scale']} the result alone would take about "
+                f"{_format_size(result)} and {_format_size(spare)} is free. A "
+                "smaller output size, or closing something, would make room"
+            )
+
+        budget = memory_budget(network["runs_on"])
+        if tile > 0 or budget is None:
+            return tile, tile_pad
+        if network["runs_on"] == "cpu":
+            budget = max(budget - result, 0)
+
+        model = network["model"]
+        per_pixel = memory_per_pixel(model, network["scale"])
+        tile = fit_tile(width, height, per_pixel, budget)
+        if tile == 0:
+            return 0, tile_pad
+
+        reason = (
+            f"In one piece this would take about "
+            f"{_format_size(width * height * per_pixel)}, more than the "
+            f"{_format_size(budget)} it can have, so it goes through in {tile} px "
+            "tiles"
+        )
+        if hasattr(model, "upscale_tiled"):
+            update_status(
+                f"{reason}. They share Real-CUGAN's averages, so nothing changes."
+            )
+            return tile, tile_pad
+
+        tile_pad = max(tile_pad, min(network["reach"], tile // 4))
+        update_status(
+            f"{reason} with {tile_pad} px of overlap. Faint seams are possible."
+        )
+        return tile, tile_pad
+
+    def upscale_thread(self, job):
+        started = time.monotonic()
+        sources = job["sources"]
+        count = len(sources)
+        written = []
+        networks = {}
+
+        try:
+            torch.set_num_threads(max(1, job["threads"]))
+            job["output_dir"].mkdir(parents=True, exist_ok=True)
+
+            for index, path in enumerate(sources):
+                if self.stop_event.is_set():
+                    raise KeyboardInterrupt()
+
+                label = path.name if count == 1 else f"{index + 1}/{count} {path.name}"
+                try:
+                    picture = read_image(path)
+                except Exception as e:  # noqa: BLE001
+                    update_status(f"Skipped {path.name}: {e}")
+                    continue
+
+                image = picture["image"]
+                width, height = image.size
+                out_width, out_height = image_target_size(
+                    width, height, job["preset"], job["out_width"], job["out_height"]
+                )
+                weights = job["weights"] or image_weights(
+                    job["model_id"], width, height, out_width, out_height, job["level"]
+                )
+                if weights not in networks:
+                    networks[weights] = self._open_network(job, weights)
+                network = networks[weights]
+
+                if picture["frames"] > 1:
+                    update_status(
+                        f"{path.name} has {picture['frames']} frames. Only the "
+                        "first is upscaled."
+                    )
+                update_status(
+                    f"Upscaling {label} from {width}x{height} to "
+                    f"{out_width}x{out_height}..."
+                )
+                GLib.idle_add(self._set_progress, index / count, f"{label}: starting")
+
+                def report(fraction, index=index, label=label):
+                    elapsed = _format_duration(time.monotonic() - started)
+                    GLib.idle_add(
+                        self._set_progress,
+                        (index + fraction) / count,
+                        f"{label}: {fraction:.0%}  |  elapsed {elapsed}",
+                    )
+
+                try:
+                    dest = self._upscale_one(
+                        job, network, path, picture, (out_width, out_height), report
+                    )
+                except Exception as e:  # noqa: BLE001
+                    if self.stop_event.is_set():
+                        raise KeyboardInterrupt() from e
+                    traceback.print_exc()
+                    update_status(f"Skipped {path.name}: {e}")
+                    continue
+                finally:
+                    del image, picture
+                    gc.collect()
+                written.append(dest)
+
+            elapsed = time.monotonic() - started
+            if count > 1:
+                update_status(
+                    f"Done. {len(written)} of {count} images in "
+                    f"{_format_duration(elapsed)}, saved in {job['output_dir']}."
+                )
+            if written:
+                GLib.idle_add(self._set_progress, 1.0, "Finished")
+            else:
+                GLib.idle_add(self._set_progress, 0.0, "Failed")
+
+        except KeyboardInterrupt:
+            if written:
+                update_status(
+                    f"Stopped after {len(written)} of {count} images. Those stay "
+                    "saved."
+                )
+            else:
+                update_status("Stopped.")
+            GLib.idle_add(self._set_progress, 0.0, "Stopped")
+        except Exception as e:  # noqa: BLE001
+            if self.stop_event.is_set():
+                update_status("Stopped.")
+            else:
+                traceback.print_exc()
+                update_status(f"Error: {e}")
+            GLib.idle_add(self._set_progress, 0.0, "Failed")
+        finally:
+            for network in networks.values():
+                close = getattr(network["model"], "close", None)
+                if close is not None:
+                    close()
+            networks.clear()
+            gc.collect()
+            GLib.idle_add(self._finish)
+
+    def _upscale_one(self, job, network, path, picture, size, report):
+        image = picture["image"]
+        width, height = image.size
+        tile, tile_pad = self._tiles_for(network, width, height)
+        mark = time.monotonic()
+        result = upscale_image(
+            network["model"],
+            image,
+            network["scale"],
+            tile,
+            tile_pad,
+            network["multiple"],
+            device=network["device"],
+            dtype=network["dtype"],
+            channels_last=network["channels_last"],
+            stop_check=self.stop_event.is_set,
+            on_progress=report,
+        )
+        if result is None or self.stop_event.is_set():
+            raise KeyboardInterrupt()
+        if result.size != size:
+            result = result.resize(size, _PILImage.Resampling.LANCZOS)
+
+        fmt, reason = output_format(job["format"], result)
+        if reason:
+            update_status(f"{path.name}: {reason}, so it is saved as PNG.")
+
+        dest = unique_path(job["output_dir"] / f"{path.stem}_{size[0]}x{size[1]}.{fmt}")
+        text = dict(picture["text"])
+        text.update(
+            software="Animus",
+            upscaler=network["description"],
+            upscaled=f"{width}x{height} -> {size[0]}x{size[1]}",
+        )
+        save_image(
+            result,
+            dest,
+            fmt,
+            job["quality"],
+            text=text,
+            icc_profile=picture["icc_profile"],
+            exif=picture["exif"],
+        )
+        self.current_output = dest
+        update_status(
+            f"Saved {dest} ({_format_size(dest.stat().st_size)}) after "
+            f"{_format_duration(time.monotonic() - mark)}."
+        )
+        self._post_result(dest, image, result)
+        return dest
+
+    def _post_result(self, dest, source, result):
+        width, height = result.size
+        note = f"{dest.name}  |  {width}x{height}"
+        factor = min(1.0, RESULT_DISPLAY_LIMIT / max(width, height))
+        size = (max(1, round(width * factor)), max(1, round(height * factor)))
+        if size != result.size:
+            result = result.resize(size, _PILImage.Resampling.LANCZOS)
+            note += f", shown at {factor:.0%}"
+
+        if source.mode in ("RGB", "RGBA", "L", "LA"):
+            source = source.resize(size, _PILImage.Resampling.BICUBIC)
+        plain, alpha, _gray = split_image(source)
+        if alpha is not None:
+            plain.putalpha(alpha)
+        mode = "RGBA" if alpha is not None else "RGB"
+        shown = result.convert(mode)
+        plain = plain.resize(size, _PILImage.Resampling.BICUBIC)
+
+        GLib.idle_add(
+            self._show_result,
+            shown.tobytes(),
+            plain.tobytes(),
+            shown.size,
+            alpha is not None,
+            note,
+        )
+
+    def _show_result(self, shown, plain, size, has_alpha, note):
+        width, height = size
+        stride = width * (4 if has_alpha else 3)
+
+        def pixbuf(data):
+            return GdkPixbuf.Pixbuf.new_from_bytes(
+                GLib.Bytes.new(data),
+                GdkPixbuf.Colorspace.RGB,
+                has_alpha,
+                8,
+                width,
+                height,
+                stride,
+            )
+
+        try:
+            self._pixbufs = {"result": pixbuf(shown), "plain": pixbuf(plain)}
+        except Exception as e:  # noqa: BLE001
+            print(f"Could not display the result: {e}.", file=sys.stderr)
+            return False
+
+        self._shown_note = note
+        self.compare_button.set_sensitive(True)
+        self._refresh_result()
+        self.window.show_output(self)
+        return False
+
+    def _refresh_result(self):
+        plain = self.compare_button.get_active()
+        pixbuf = self._pixbufs.get("plain" if plain else "result")
+        if pixbuf is None:
+            return
+        self.result_image.set_from_pixbuf(pixbuf)
+        if plain:
+            self.result_note.set_text(
+                f"{self._shown_note}  |  a plain bicubic resize, for comparison"
+            )
+        else:
+            self.result_note.set_text(self._shown_note)
+
+    def on_compare_toggled(self, button):
+        self._refresh_result()
 
 
 def _has_encoder(name):
@@ -8008,6 +9614,277 @@ def benchmark(target=None):
     return 0
 
 
+def _self_test_cugan(check):
+    torch.manual_seed(0)
+    state = dict(RealCUGAN(scale=4).state_dict())
+    state["pro"] = torch.tensor(1.0)
+    try:
+        model, scale, multiple, _overlap, description = build_upscaler(state)
+        model.load_state_dict(state, strict=True)
+    except Exception as e:  # noqa: BLE001
+        check("Real-CUGAN: pro weights load", False, str(e))
+        return
+    check("Real-CUGAN: pro weights load", model.pro and scale == 4, description)
+
+    model.eval()
+    frame = torch.rand(1, 3, 21, 18)
+    with torch.inference_mode():
+        whole = model(frame)
+        tiled = upscale_frame(model, frame, scale, 8, 0, multiple)
+    check(
+        "Real-CUGAN: a frame smaller than its margin",
+        tuple(whole.shape) == (1, 3, 84, 72) and bool(torch.isfinite(whole).all()),
+        str(tuple(whole.shape)),
+    )
+    delta = (whole - tiled).abs().max().item()
+    check(
+        "Real-CUGAN: tiles share the whole-image statistics",
+        delta < 1e-4 * max(1.0, whole.abs().max().item()),
+        f"max |diff| = {delta:.2e}",
+    )
+
+
+def _self_test_images(check):
+    import tempfile
+
+    model = SRVGGNetCompact(num_feat=8, num_conv=2, upscale=2).eval()
+    with torch.no_grad():
+        model.body[-1].weight.zero_()
+        model.body[-1].bias.zero_()
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+
+    def enlarge(image, tile=0):
+        return upscale_image(model, image, 2, tile, 4)
+
+    sprite = _PILImage.new("RGBA", (24, 16), (255, 0, 255, 0))
+    sprite.paste((90, 140, 200, 255), (12, 0, 24, 16))
+    result = enlarge(sprite, tile=8)
+    alpha = numpy.asarray(result.getchannel("A"))
+    hidden = result.convert("RGB").getpixel((22, 0))
+    check(
+        "images: transparency survives",
+        result.size == (48, 32)
+        and alpha[:, :24].max() == 0
+        and alpha[:, 24:].min() == 255,
+        f"{result.mode} {result.size}",
+    )
+    check(
+        "images: hidden colors are filled in from the visible ones",
+        hidden == (90, 140, 200),
+        str(hidden),
+    )
+
+    opaque = enlarge(_PILImage.new("RGBA", (6, 4), (5, 6, 7, 255)))
+    check("images: an opaque alpha channel is dropped", opaque.mode == "RGB")
+
+    gray = enlarge(_PILImage.new("L", (10, 6), 77))
+    check(
+        "images: grayscale stays grayscale",
+        gray.mode == "L" and gray.getextrema() == (77, 77),
+        f"{gray.mode} {gray.getextrema()}",
+    )
+
+    shaded = _PILImage.new("LA", (8, 4), (30, 0))
+    shaded.paste((200, 255), (4, 0, 8, 4))
+    shaded = enlarge(shaded)
+    check("images: gray with alpha stays gray with alpha", shaded.mode == "LA")
+
+    indexed = _PILImage.new("P", (8, 4), 0)
+    indexed.putpalette([10, 20, 30, 200, 100, 50] + [0] * 762)
+    indexed.paste(1, (4, 0, 8, 4))
+    indexed.info["transparency"] = 0
+    indexed = enlarge(indexed)
+    check(
+        "images: a palette with a transparent index",
+        indexed.mode == "RGBA"
+        and indexed.getpixel((15, 0)) == (200, 100, 50, 255)
+        and indexed.getpixel((0, 0))[3] == 0,
+        f"{indexed.mode} {indexed.getpixel((15, 0))}",
+    )
+
+    deep = _PILImage.fromarray(numpy.array([[0, 32896, 65535]] * 2, dtype=numpy.uint16))
+    flat, _alpha, is_gray = split_image(deep)
+    levels = sorted({pixel[0] for pixel in flat.getdata()})
+    check(
+        "images: 16-bit gray is scaled, not clipped",
+        is_gray and levels == [0, 128, 255],
+        f"{deep.mode} -> {levels}",
+    )
+
+    for preset, custom, want in (
+        ("x1", (0, 0), (99, 51)),
+        ("x3", (0, 0), (297, 153)),
+        ("fit", (640, 360), (640, 330)),
+        ("fit", (360, 640), (360, 185)),
+    ):
+        got = image_target_size(99, 51, preset, *custom)
+        into = f" into {custom[0]}x{custom[1]}" if preset == "fit" else ""
+        check(f"image_target_size {preset} from 99x51{into}", got == want, str(got))
+
+    photo = IMAGE_FAMILIES[REAL_ESRGAN_ID]
+    for target, want in (
+        ((100, 50), (2, 2)),
+        ((200, 100), (2, 2)),
+        ((250, 125), (3, 4)),
+        ((400, 200), (4, 4)),
+        ((800, 400), (4, 4)),
+    ):
+        got = (
+            pick_scale(CUGAN_SCALES, 100, 50, *target),
+            pick_scale(photo, 100, 50, *target),
+        )
+        check(
+            f"images: native scales for 100x50 -> {target[0]}x{target[1]}",
+            got == want,
+            str(got),
+        )
+    check(
+        "images: Real-CUGAN x3 falls back to its strong denoise",
+        cugan_weights(3, "denoise1x").name == "up3x-latest-denoise3x.pth",
+    )
+
+    converted = types.SimpleNamespace(architecture=RRDBNet)
+    check(
+        "images: a converted RRDBNet still counts as heavy",
+        is_heavy(converted) and not is_heavy(model),
+    )
+
+    for fmt, size, mode, want in (
+        ("webp", (16384, 8), "RGB", "png"),
+        ("webp", (16383, 8), "RGB", "webp"),
+        ("jpg", (8, 8), "RGBA", "png"),
+        ("jpg", (8, 8), "L", "jpg"),
+    ):
+        got, _reason = output_format(fmt, _PILImage.new(mode, size))
+        check(f"images: {fmt} for a {size[0]} px {mode} image", got == want, got)
+
+    def profile(space):
+        return bytes(16) + space + bytes(108)
+
+    for space, mode, fmt, want in (
+        (b"RGB ", "RGB", "png", True),
+        (b"CMYK", "RGB", "jpg", False),
+        (b"GRAY", "L", "png", True),
+        (b"GRAY", "L", "webp", False),
+        (b"GRAY", "RGB", "png", False),
+    ):
+        check(
+            f"images: a {space.decode().strip()} profile on {mode} {fmt}",
+            icc_fits(profile(space), mode, fmt) == want,
+        )
+
+    try:
+        upscale_image(
+            model, _PILImage.new("RGB", (8, 8)), 2, 0, 0, stop_check=lambda: True
+        )
+        stopped = False
+    except KeyboardInterrupt:
+        stopped = True
+    check("images: Stop interrupts a whole-image run", stopped)
+
+    rrdb = memory_per_pixel(RRDBNet(scale=2, num_feat=8, num_block=1), 2)
+    for width, height, budget in ((612, 408, 4 << 30), (4000, 3000, 4 << 30)):
+        tile = fit_tile(width, height, rrdb, budget)
+        patch = tile + 2 * (tile // 4)
+        whole = width * height * rrdb <= budget
+        check(
+            f"images: {width}x{height} at x2 in {budget >> 30} GB",
+            tile == 0 if whole else 0 < patch * patch * rrdb <= budget,
+            "whole" if tile == 0 else f"{tile} px tiles",
+        )
+
+    with tempfile.TemporaryDirectory(prefix="animus-images-") as workdir:
+        work = Path(workdir)
+
+        exif = _PILImage.Exif()
+        exif[EXIF_ORIENTATION] = 6
+        _PILImage.new("RGB", (30, 20), (10, 200, 30)).save(
+            work / "turned.jpg", exif=exif
+        )
+        turned = read_image(work / "turned.jpg")
+        save_image(turned["image"], work / "upright.png", "png", exif=turned["exif"])
+        with _PILImage.open(work / "upright.png") as reopened:
+            kept = reopened.getexif().get(EXIF_ORIENTATION)
+        check(
+            "images: the EXIF orientation is applied, and only once",
+            turned["image"].size == (20, 30) and kept is None,
+            f"{turned['image'].size}, orientation {kept} after saving",
+        )
+
+        xmp = PngInfo()
+        xmp.add_itxt(
+            "XML:com.adobe.xmp",
+            '<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3'
+            '.org/1999/02/22-rdf-syntax-ns#"><rdf:Description xmlns:tiff="http://ns'
+            '.adobe.com/tiff/1.0/" tiff:Orientation="6"/></rdf:RDF></x:xmpmeta>',
+        )
+        _PILImage.new("RGB", (30, 20)).save(work / "xmp.png", pnginfo=xmp)
+        sideways = read_image(work / "xmp.png")
+        save_image(
+            sideways["image"], work / "xmp_out.png", "png", text=sideways["text"]
+        )
+        with _PILImage.open(work / "xmp_out.png") as reopened:
+            kept = reopened.getexif().get(EXIF_ORIENTATION)
+        check(
+            "images: an XMP orientation is not carried into the output",
+            sideways["image"].size == (20, 30) and kept is None,
+            f"{sideways['image'].size}, orientation {kept} after saving",
+        )
+
+        info = PngInfo()
+        info.add_text("prompt", "a lighthouse at dusk")
+        _PILImage.new("RGB", (6, 4), (1, 2, 3)).save(work / "made.png", pnginfo=info)
+        picture = read_image(work / "made.png")
+        result = enlarge(picture["image"])
+        dest = unique_path(work / "made.png")
+        check("images: an existing name gets a number", dest.name == "made_2.png")
+        save_image(result, dest, "png", text=dict(picture["text"], upscaler="test"))
+        with _PILImage.open(dest) as reopened:
+            text = dict(reopened.text)
+        check(
+            "images: PNG text survives the upscale",
+            text.get("prompt") == "a lighthouse at dusk"
+            and text.get("upscaler") == "test",
+            str(text),
+        )
+
+        for fmt, quality in (("webp", 100), ("jpg", 95)):
+            target = work / f"made.{fmt}"
+            save_image(result, target, fmt, quality)
+            with _PILImage.open(target) as reopened:
+                same = reopened.convert("RGB").tobytes() == result.tobytes()
+                ok = reopened.size == result.size and (same or fmt == "jpg")
+            check(f"images: {fmt} round trip", ok, f"lossless {same}")
+
+        batch = work / "batch"
+        batch.mkdir()
+        for name in ("b.jpg", "a.png", "notes.txt"):
+            (batch / name).touch()
+        found, missing = gather_images([batch, work / "nowhere.png"])
+        check(
+            "images: a folder yields its images",
+            [path.name for path in found] == ["a.png", "b.jpg"]
+            and [path.name for path in missing] == ["nowhere.png"],
+            ", ".join(path.name for path in found + missing),
+        )
+
+        torch.manual_seed(0)
+        strong = SRVGGNetCompact(num_feat=4, num_conv=1, upscale=2).state_dict()
+        weak = SRVGGNetCompact(num_feat=4, num_conv=1, upscale=2).state_dict()
+        torch.save({"params": strong}, work / "strong.pth")
+        torch.save({"params": weak}, work / "weak.pth")
+        blend_weights(work / "strong.pth", work / "weak.pth", 0.25, work / "mixed.pth")
+        mixed = read_state_dict(work / "mixed.pth")
+        check(
+            "images: the denoise blend mixes the two networks",
+            all(
+                torch.allclose(mixed[key], 0.25 * strong[key] + 0.75 * weak[key])
+                for key in strong
+            ),
+        )
+
+
 def _self_test_schedulers(check):
     if not ANIMA_AVAILABLE:
         check("Schedulers: diffusers", False, "not installed")
@@ -8401,6 +10278,9 @@ def self_test():
             4,
             1,
         ),
+        ("Real-CUGAN x2", RealCUGAN(scale=2), 2, 2),
+        ("Real-CUGAN x3", RealCUGAN(scale=3), 3, 4),
+        ("Real-CUGAN x4", RealCUGAN(scale=4), 4, 2),
     )
 
     failures = []
@@ -8466,16 +10346,19 @@ def self_test():
             f"max |diff| = {delta:.2e}",
         )
 
-        reach, clipped = measure_reach(model, scale, multiple, overlap)
-        if reach is None:
-            check(f"{label}: reach measurable", False, "the probe did not propagate")
-        else:
-            check(
-                f"{label}: min_overlap covers the {reach} px it reads",
-                reach <= overlap and not clipped,
-                f"reads {reach} px, carries {overlap}"
-                + (", and the probe hit the edge" if clipped else ""),
-            )
+        if not hasattr(model, "upscale_tiled"):
+            reach, clipped = measure_reach(model, scale, multiple, overlap)
+            if reach is None:
+                check(
+                    f"{label}: reach measurable", False, "the probe did not propagate"
+                )
+            else:
+                check(
+                    f"{label}: min_overlap covers the {reach} px it reads",
+                    reach <= overlap and not clipped,
+                    f"reads {reach} px, carries {overlap}"
+                    + (", and the probe hit the edge" if clipped else ""),
+                )
 
         stopped = upscale_frame(
             model, wide, scale, 32, overlap, multiple, stop_check=lambda: True
@@ -8525,16 +10408,36 @@ def self_test():
         MODEL_LICENSES.get(DEFAULT_MODEL) in PERMISSIVE_LICENSES,
         MODEL_LICENSES.get(DEFAULT_MODEL, "unrecorded"),
     )
+
+    offered = builtin | {name for name, _url in EXTRA_WEIGHTS} | {REAL_CUGAN_ID}
+    wanted = set()
+    for _label, ident in IMAGE_MODELS:
+        wanted |= image_model_files(ident)
+    check(
+        "every image model downloads from somewhere",
+        wanted <= offered,
+        ", ".join(sorted(wanted - offered)) or "all known",
+    )
+    terms = {MODEL_LICENSES.get(n) for n in image_model_files(DEFAULT_IMAGE_MODEL)}
+    check(
+        "the default image model is under a license that restricts nobody",
+        terms <= PERMISSIVE_LICENSES,
+        ", ".join(sorted(str(term) for term in terms)),
+    )
     check(
         "every model offered has its license recorded",
-        builtin <= set(MODEL_LICENSES),
-        ", ".join(sorted(builtin - set(MODEL_LICENSES))) or "all recorded",
+        offered <= set(MODEL_LICENSES),
+        ", ".join(sorted(offered - set(MODEL_LICENSES))) or "all recorded",
     )
     check(
         "no license is recorded for a model that is not offered",
-        set(MODEL_LICENSES) <= builtin,
-        ", ".join(sorted(set(MODEL_LICENSES) - builtin)) or "none stale",
+        set(MODEL_LICENSES) <= offered,
+        ", ".join(sorted(set(MODEL_LICENSES) - offered)) or "none stale",
     )
+
+    _self_test_cugan(check)
+
+    _self_test_images(check)
 
     _self_test_schedulers(check)
 
@@ -8670,11 +10573,12 @@ class AnimusWindow(Gtk.Window):
         for pane in (
             GeneratePane(self),
             ZImagePane(self),
+            ImageUpscalePane(self),
             UpscalePane(self),
         ):
             self._add_pane(pane)
 
-        self.generate, self.zimage, self.upscale = self.panes
+        self.generate, self.zimage, self.image_upscale, self.upscale = self.panes
 
         self.output_notebook.set_current_page(self.console_page)
         self.mode_notebook.connect("switch-page", self.on_mode_switched)
@@ -8705,6 +10609,10 @@ class AnimusWindow(Gtk.Window):
 
     def select_mode(self, pane):
         self.mode_notebook.set_current_page(self.panes.index(pane))
+
+    def send_to_upscaler(self, path):
+        self.select_mode(self.image_upscale)
+        self.image_upscale.set_source(path)
 
     def on_mode_switched(self, notebook, page, index):
         if not 0 <= index < len(self.panes):
@@ -8993,9 +10901,10 @@ def main():
         sys.exit(zimage_render(arguments))
 
     if any(a in ("-h", "--help") for a in arguments):
-        print("Usage: animus [--self-test] [--benchmark] [--zimage] [VIDEO]")
+        print("Usage: animus [--self-test] [--benchmark] [--zimage] [VIDEO | IMAGE]")
         print()
-        print("  --self-test   check the upscaling networks and the ffmpeg pipeline")
+        print("  --self-test   check the upscaling networks and the image and video")
+        print("                pipelines")
         print("  --benchmark   time the installed upscaling models")
         print("  --zimage      render one image with Z-Image and exit")
         print()
@@ -9003,7 +10912,8 @@ def main():
         print("                   --guidance --size --width --height --seed")
         print("                   --shift --out --device (cpu, auto or vulkan:N)")
         print()
-        print("A video argument opens the Upscale tab with that file loaded.")
+        print("A video argument opens the Upscale Video tab with that file loaded,")
+        print("and an image or a folder of images opens the Upscale Image tab.")
         sys.exit(0)
 
     def sigint_handler(signum, frame):
@@ -9021,7 +10931,9 @@ def main():
     window.restore_mode()
 
     source = next((a for a in arguments if not a.startswith("-")), None)
-    if source:
+    if source and (Path(source).is_dir() or is_image_path(source)):
+        window.send_to_upscaler(source)
+    elif source:
         window.select_mode(window.upscale)
         window.upscale.set_source(source)
 
