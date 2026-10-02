@@ -989,6 +989,8 @@ BUILTIN_MODELS = (
     ),
 )
 
+HEAVY_MODELS = frozenset(("RealESRGAN_x4plus_anime_6B.pth", "RealESRGAN_x4plus.pth"))
+
 DEFAULT_MODEL = "2xLiveActionV1_SPAN.pth"
 CUSTOM_MODEL_ID = "custom"
 
@@ -1768,24 +1770,78 @@ def _write_span_ncnn(graph, model, scale):
     graph.unary("PixelShuffle", "shuffle", "shuffled", "out", [f"0={scale}", "1=0"])
 
 
-def write_ncnn_model(state_dict, param_path, bin_path):
-    model, scale, size_multiple, min_overlap, description = build_upscaler(state_dict)
-    if not isinstance(model, (SRVGGNetCompact, SPAN)):
-        raise TypeError(
-            f"{description} is not a compact generator. Only those are "
-            "converted, because the heavy ones are not worth running on video."
+def _write_rrdb_ncnn(graph, model, scale):
+    source = graph.input()
+    if scale != 4:
+        source = graph.unary(
+            "Reorg", "unshuffle", source, "unshuffled", [f"0={4 // scale}", "1=0"]
         )
+
+    def emit(name, module, source, target):
+        return graph.conv(name, source, target, module, module.weight, module.bias)
+
+    def lrelu(name, activation, source, target):
+        slope = float(activation.negative_slope)
+        return graph.unary("ReLU", name, source, target, [f"0={slope}"])
+
+    def residual(name, branch, shortcut, target):
+        scaled = graph.scalar(f"{name}mul", BINARY_MUL, branch, f"{target}_m", 0.2)
+        return graph.binary(f"{name}add", BINARY_ADD, scaled, shortcut, target)
+
+    feature = emit("conv_first", model.conv_first, source, "feature")
+
+    flowing = feature
+    for index, rrdb in enumerate(model.body):
+        entering = flowing
+        for part, rdb in enumerate((rrdb.rdb1, rrdb.rdb2, rrdb.rdb3)):
+            tag = f"r{index}d{part}"
+            dense, joined = [flowing], flowing
+            for step in range(1, 6):
+                if step > 1:
+                    joined = graph.add(
+                        "Concat", f"{tag}cat{step}", dense, [f"{tag}_j{step}"], ["0=0"]
+                    )
+                conv = getattr(rdb, f"conv{step}")
+                grown = emit(f"{tag}c{step}", conv, joined, f"{tag}_c{step}")
+                if step < 5:
+                    grown = lrelu(f"{tag}a{step}", rdb.lrelu, grown, f"{tag}_x{step}")
+                    dense.append(grown)
+            flowing = residual(tag, grown, flowing, f"{tag}_o")
+        flowing = residual(f"r{index}", flowing, entering, f"r{index}_o")
+
+    body = emit("conv_body", model.conv_body, flowing, "body")
+    feature = graph.binary("trunk", BINARY_ADD, feature, body, "trunk")
+
+    for step, conv in enumerate((model.conv_up1, model.conv_up2), 1):
+        wide = graph.unary(
+            "Interp", f"wide{step}", feature, f"wide{step}", ["0=1", "1=2.0", "2=2.0"]
+        )
+        upscaled = emit(f"up{step}", conv, wide, f"up{step}")
+        feature = lrelu(f"up{step}a", model.lrelu, upscaled, f"u{step}")
+
+    detail = emit("conv_hr", model.conv_hr, feature, "hr")
+    detail = lrelu("hra", model.lrelu, detail, "hra")
+    emit("conv_last", model.conv_last, detail, "out")
+
+
+def write_ncnn_model(state_dict, param_path, bin_path):
+    built = build_upscaler(state_dict)
+    model, scale, _multiple, _overlap, description = built
     model.load_state_dict(state_dict, strict=True)
 
     graph = NcnnGraph()
     if isinstance(model, SPAN):
         model.fuse()
         _write_span_ncnn(graph, model, scale)
-    else:
+    elif isinstance(model, RRDBNet):
+        _write_rrdb_ncnn(graph, model, scale)
+    elif isinstance(model, SRVGGNetCompact):
         _write_compact_ncnn(graph, model, state_dict, scale)
+    else:
+        raise TypeError(f"{description} has no ncnn converter.")
     graph.write(param_path, bin_path)
 
-    return scale, size_multiple, min_overlap, description
+    return built
 
 
 class NcnnUpscaler:
@@ -1898,15 +1954,19 @@ def load_ncnn_upscaler(weights, gpu=None, threads=0, fp16=True):
     state_dict = read_state_dict(weights)
     if stale:
         print(f"Converting {weights.name} to ncnn...")
-        scale, size_multiple, min_overlap, description = write_ncnn_model(
-            state_dict, param_path, bin_path
-        )
+        built = write_ncnn_model(state_dict, param_path, bin_path)
     else:
-        _model, scale, size_multiple, min_overlap, description = build_upscaler(
-            state_dict
-        )
+        built = build_upscaler(state_dict)
+    network, scale, size_multiple, min_overlap, description = built
 
-    model = NcnnUpscaler(param_path, bin_path, threads=threads, gpu=gpu, fp16=fp16)
+    model = NcnnUpscaler(
+        param_path,
+        bin_path,
+        num_out_ch=network.num_out_ch,
+        threads=threads,
+        gpu=gpu,
+        fp16=fp16,
+    )
 
     if gpu is not None and not model.on_gpu:
         print(
@@ -6836,6 +6896,7 @@ class UpscalePane:
         model = self.model_combo.get_active_id() or DEFAULT_MODEL
         custom = model == CUSTOM_MODEL_ID
         self.custom_model_box.set_sensitive(custom)
+        self._apply_auto_knobs()
 
         if custom:
             self.model_note.set_text("Bring your own checkpoint.")
@@ -6851,8 +6912,9 @@ class UpscalePane:
 
     def _auto_knobs(self):
         gpu = (self.device_combo.get_active_id() or "cpu").startswith("ncnn:")
+        heavy = (self.model_combo.get_active_id() or DEFAULT_MODEL) in HEAVY_MODELS
         return {
-            "tile": 0 if gpu else DEFAULT_TILE,
+            "tile": 0 if gpu and not heavy else DEFAULT_TILE,
             "precision": "float16" if gpu else DEFAULT_PRECISION,
         }
 
@@ -6876,6 +6938,9 @@ class UpscalePane:
             self._user_set.add(key)
 
     def on_device_changed(self, widget=None):
+        self._apply_auto_knobs()
+
+    def _apply_auto_knobs(self):
         if self._loading_settings:
             return
         for key, value in self._auto_knobs().items():
@@ -7241,7 +7306,7 @@ class UpscalePane:
                 update_status(
                     f"Working in {tile} px tiles with {tile_pad} px of overlap."
                 )
-                if on_ncnn:
+                if on_ncnn and model_path.name not in HEAVY_MODELS:
                     update_status(
                         "On a GPU that is usually the wrong trade. Every tile "
                         "is a separate upload, dispatch and download, and the "
@@ -7539,6 +7604,11 @@ def _ncnn_probe_models():
         for parameter in model.parameters():
             nn.init.normal_(parameter, std=0.05)
         yield f"span norm={str(norm).lower()}", model
+    for scale in (4, 2, 1):
+        model = RRDBNet(scale=scale, num_feat=8, num_block=2, num_grow_ch=4)
+        for parameter in model.parameters():
+            nn.init.normal_(parameter, std=0.2)
+        yield f"rrdb x{scale}", model
 
 
 def _self_test_ncnn(check):
@@ -7612,7 +7682,8 @@ def _self_test_ncnn_model(check, architecture, reference, tempfile):
                 check(
                     f"{name} matches torch",
                     delta < limit,
-                    f"max |diff| = {delta:.2e} ({delta * 255:.2f}/255)",
+                    f"max |diff| = {delta:.2e} "
+                    f"({delta / spread * 255:.2f}/255 of full scale)",
                 )
                 model.close()
 
