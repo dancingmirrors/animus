@@ -1,0 +1,93 @@
+#version 450
+
+// One row per workgroup. RMSNorm, or LayerNorm with FLAG_CENTER:
+//   normed = norm(X[row]) [* W] [* (1 + S)] [* tanh(S)]
+//   Y[row] = normed, or Y[row] += normed with FLAG_RESIDUAL.
+// S is an adaLN chunk: FLAG_SCALE uses 1 + S, FLAG_GATE uses tanh(S).
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Push {
+    uint rows;
+    uint D;
+    uint ldx;
+    uint ldy;
+    uint offX;
+    uint offY;
+    uint offW;
+    uint offS;
+    uint flags;
+    float eps;
+} pc;
+
+#define FLAG_WEIGHT 1u
+#define FLAG_SCALE 2u
+#define FLAG_RESIDUAL 4u
+#define FLAG_GATE 8u
+#define FLAG_CENTER 16u
+
+layout(set = 0, binding = 0) readonly buffer BufX { float X[]; };
+layout(set = 0, binding = 1) buffer BufY { float Y[]; };
+layout(set = 0, binding = 2) readonly buffer BufW { float W[]; };
+layout(set = 0, binding = 3) readonly buffer BufS { float S[]; };
+
+shared float red[256];
+
+float reduce_sum(float v) {
+    uint tid = gl_LocalInvocationID.x;
+    red[tid] = v;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (tid < s) {
+            red[tid] += red[tid + s];
+        }
+        barrier();
+    }
+    float total = red[0];
+    barrier();
+    return total;
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.rows) {
+        return;
+    }
+    uint tid = gl_LocalInvocationID.x;
+    uint xb = pc.offX + row * pc.ldx;
+    uint yb = pc.offY + row * pc.ldy;
+
+    float mean = 0.0;
+    if ((pc.flags & FLAG_CENTER) != 0u) {
+        float partial = 0.0;
+        for (uint c = tid; c < pc.D; c += 256u) {
+            partial += X[xb + c];
+        }
+        mean = reduce_sum(partial) / float(pc.D);
+    }
+
+    float partial = 0.0;
+    for (uint c = tid; c < pc.D; c += 256u) {
+        float v = X[xb + c] - mean;
+        partial += v * v;
+    }
+    float inv = inversesqrt(reduce_sum(partial) / float(pc.D) + pc.eps);
+
+    for (uint c = tid; c < pc.D; c += 256u) {
+        float v = (X[xb + c] - mean) * inv;
+        if ((pc.flags & FLAG_WEIGHT) != 0u) {
+            v *= W[pc.offW + c];
+        }
+        if ((pc.flags & FLAG_SCALE) != 0u) {
+            v *= 1.0 + S[pc.offS + c];
+        }
+        if ((pc.flags & FLAG_GATE) != 0u) {
+            v *= tanh(S[pc.offS + c]);
+        }
+        if ((pc.flags & FLAG_RESIDUAL) != 0u) {
+            Y[yb + c] += v;
+        } else {
+            Y[yb + c] = v;
+        }
+    }
+}

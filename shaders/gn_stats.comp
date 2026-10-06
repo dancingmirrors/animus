@@ -1,0 +1,45 @@
+#version 450
+
+// GroupNorm statistics over an NHWC tensor, one block of pixels per workgroup:
+// pass 0 sums x per group, pass 1 sums (x - mean[g])^2. Partials go to
+// Out[block * G + g].
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Push {
+    uint P, C, G;
+    uint block_pixels;
+    uint pass_;
+    uint offX, offMean, offOut;
+} pc;
+
+layout(set = 0, binding = 0) readonly buffer BufX { float X[]; };
+layout(set = 0, binding = 1) readonly buffer BufMean { float Mean[]; };
+layout(set = 0, binding = 2) writeonly buffer BufOut { float Out[]; };
+
+shared float acc[1024];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint block = gl_WorkGroupID.x;
+    uint p0 = block * pc.block_pixels;
+    uint p1 = min(pc.P, p0 + pc.block_pixels);
+    uint cg = pc.C / pc.G;
+    for (uint c = tid; c < pc.C; c += 256u) {
+        float m = (pc.pass_ != 0u) ? Mean[pc.offMean + c / cg] : 0.0;
+        float s = 0.0;
+        for (uint p = p0; p < p1; p++) {
+            float v = X[pc.offX + p * pc.C + c] - m;
+            s += (pc.pass_ != 0u) ? v * v : v;
+        }
+        acc[c] = s;
+    }
+    barrier();
+    for (uint g = tid; g < pc.G; g += 256u) {
+        float t = 0.0;
+        for (uint k = 0u; k < cg; k++) {
+            t += acc[g * cg + k];
+        }
+        Out[pc.offOut + block * pc.G + g] = t;
+    }
+}

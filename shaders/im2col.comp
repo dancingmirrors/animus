@@ -1,0 +1,49 @@
+#version 450
+
+// Gathers each output pixel's k x k window of an NHWC float32 tensor into one
+// row of the matmul's A matrix, tap-major (ky, kx, c). With upsample, the
+// source is read at half coordinates, so a nearest 2x upsample never has to
+// be materialized. Rows [row0, row0 + rows) of the output only.
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Push {
+    uint H, W, C;
+    uint OH, OW;
+    uint ksize;
+    uint upsample;
+    uint row0, rows;
+    uint offIn, offOut;
+} pc;
+
+layout(set = 0, binding = 0) readonly buffer In { float X[]; };
+layout(set = 0, binding = 1) writeonly buffer Out { float A[]; };
+
+void main() {
+    uint taps = pc.ksize * pc.ksize;
+    uint rowlen = taps * pc.C;
+    uint total = pc.rows * pc.OW * rowlen;
+    uint stride = gl_NumWorkGroups.x * 256u;
+    int pad = int(pc.ksize / 2u);
+    for (uint i = gl_GlobalInvocationID.x; i < total; i += stride) {
+        uint pixel = i / rowlen;
+        uint rem = i - pixel * rowlen;
+        uint tap = rem / pc.C;
+        uint c = rem - tap * pc.C;
+        uint oy = pc.row0 + pixel / pc.OW;
+        uint ox = pixel % pc.OW;
+        int sy = int(oy) + int(tap / pc.ksize) - pad;
+        int sx = int(ox) + int(tap % pc.ksize) - pad;
+        float v = 0.0;
+        if (sy >= 0 && sy < int(pc.OH) && sx >= 0 && sx < int(pc.OW)) {
+            uint iy = uint(sy);
+            uint ix = uint(sx);
+            if (pc.upsample != 0u) {
+                iy >>= 1;
+                ix >>= 1;
+            }
+            v = X[pc.offIn + (iy * pc.W + ix) * pc.C + c];
+        }
+        A[pc.offOut + i] = v;
+    }
+}

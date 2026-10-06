@@ -1,0 +1,36 @@
+#version 450
+
+// Y = (X - mean[g]) * rstd[g] * gamma[c] + beta[c], SiLU'd with FLAG_SILU.
+// Stats holds G means then G reciprocal standard deviations.
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Push {
+    uint P, C, G;
+    uint flags;
+    uint offX, offY, offStats, offGamma, offBeta;
+} pc;
+
+#define FLAG_SILU 1u
+
+layout(set = 0, binding = 0) readonly buffer BufX { float X[]; };
+layout(set = 0, binding = 1) writeonly buffer BufY { float Y[]; };
+layout(set = 0, binding = 2) readonly buffer BufStats { float Stats[]; };
+layout(set = 0, binding = 3) readonly buffer BufGamma { float Gamma[]; };
+layout(set = 0, binding = 4) readonly buffer BufBeta { float Beta[]; };
+
+void main() {
+    uint total = pc.P * pc.C;
+    uint stride = gl_NumWorkGroups.x * 256u;
+    uint cg = pc.C / pc.G;
+    for (uint i = gl_GlobalInvocationID.x; i < total; i += stride) {
+        uint c = i % pc.C;
+        uint g = c / cg;
+        float v = (X[pc.offX + i] - Stats[pc.offStats + g]) * Stats[pc.offStats + pc.G + g];
+        v = v * Gamma[pc.offGamma + c] + Beta[pc.offBeta + c];
+        if ((pc.flags & FLAG_SILU) != 0u) {
+            v = v / (1.0 + exp(-v));
+        }
+        Y[pc.offY + i] = v;
+    }
+}

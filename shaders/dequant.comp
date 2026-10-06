@@ -1,0 +1,277 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+
+// One ggml block per thread, unpacked to float16 in matrix order. Bytes are
+// read as 16-bit words: every block type is an even size. Built per -D<TYPE>.
+
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform Push {
+    uint n_blocks;
+    uint off_src;   // bytes (even)
+    uint off_dst;   // elements
+} pc;
+
+layout(set = 0, binding = 0) readonly buffer Src { uint16_t src[]; };
+layout(set = 0, binding = 1) writeonly buffer Dst { float16_t dst[]; };
+
+uint half_at(uint byte_offset) {
+    return uint(src[byte_offset >> 1]);
+}
+
+uint byte_at(uint byte_offset) {
+    return (uint(src[byte_offset >> 1]) >> ((byte_offset & 1u) * 8u)) & 0xFFu;
+}
+
+float f16_at(uint byte_offset) {
+    return unpackHalf2x16(uint(src[byte_offset >> 1])).x;
+}
+
+int s8(uint b) {
+    return int(b << 24) >> 24;
+}
+
+void put(uint i, float v) {
+    dst[i] = float16_t(v);
+}
+
+#if defined(Q8_0)
+#define BLOCK 32u
+#define TYPE_SIZE 34u
+void dequant_block(uint off, uint o) {
+    float d = f16_at(off);
+    for (uint j = 0u; j < 32u; j += 2u) {
+        uint w = half_at(off + 2u + j);
+        put(o + j, d * float(s8(w & 0xFFu)));
+        put(o + j + 1u, d * float(s8(w >> 8)));
+    }
+}
+
+#elif defined(Q4_0)
+#define BLOCK 32u
+#define TYPE_SIZE 18u
+void dequant_block(uint off, uint o) {
+    float d = f16_at(off);
+    for (uint j = 0u; j < 16u; j += 2u) {
+        uint w = half_at(off + 2u + j);
+        uint b0 = w & 0xFFu, b1 = w >> 8;
+        put(o + j, d * (float(b0 & 0xFu) - 8.0));
+        put(o + j + 1u, d * (float(b1 & 0xFu) - 8.0));
+        put(o + j + 16u, d * (float(b0 >> 4) - 8.0));
+        put(o + j + 17u, d * (float(b1 >> 4) - 8.0));
+    }
+}
+
+#elif defined(Q4_1)
+#define BLOCK 32u
+#define TYPE_SIZE 20u
+void dequant_block(uint off, uint o) {
+    float d = f16_at(off);
+    float m = f16_at(off + 2u);
+    for (uint j = 0u; j < 16u; j += 2u) {
+        uint w = half_at(off + 4u + j);
+        uint b0 = w & 0xFFu, b1 = w >> 8;
+        put(o + j, d * float(b0 & 0xFu) + m);
+        put(o + j + 1u, d * float(b1 & 0xFu) + m);
+        put(o + j + 16u, d * float(b0 >> 4) + m);
+        put(o + j + 17u, d * float(b1 >> 4) + m);
+    }
+}
+
+#elif defined(Q5_0)
+#define BLOCK 32u
+#define TYPE_SIZE 22u
+void dequant_block(uint off, uint o) {
+    float d = f16_at(off);
+    uint qh = half_at(off + 2u) | (half_at(off + 4u) << 16);
+    for (uint j = 0u; j < 16u; j++) {
+        uint q = byte_at(off + 6u + j);
+        uint xh_0 = ((qh >> j) << 4) & 0x10u;
+        uint xh_1 = (qh >> (j + 12u)) & 0x10u;
+        put(o + j, d * float(int((q & 0xFu) | xh_0) - 16));
+        put(o + j + 16u, d * float(int((q >> 4) | xh_1) - 16));
+    }
+}
+
+#elif defined(Q5_1)
+#define BLOCK 32u
+#define TYPE_SIZE 24u
+void dequant_block(uint off, uint o) {
+    float d = f16_at(off);
+    float m = f16_at(off + 2u);
+    uint qh = half_at(off + 4u) | (half_at(off + 6u) << 16);
+    for (uint j = 0u; j < 16u; j++) {
+        uint q = byte_at(off + 8u + j);
+        uint xh_0 = ((qh >> j) << 4) & 0x10u;
+        uint xh_1 = (qh >> (j + 12u)) & 0x10u;
+        put(o + j, d * float((q & 0xFu) | xh_0) + m);
+        put(o + j + 16u, d * float((q >> 4) | xh_1) + m);
+    }
+}
+
+#elif defined(Q2_K)
+#define BLOCK 256u
+#define TYPE_SIZE 84u
+void dequant_block(uint off, uint o) {
+    float d = f16_at(off + 80u);
+    float mn = f16_at(off + 82u);
+    uint q = off + 16u;
+    uint is = 0u;
+    for (uint n = 0u; n < 2u; n++) {
+        uint shift = 0u;
+        for (uint j = 0u; j < 4u; j++) {
+            uint sc = byte_at(off + is);
+            is++;
+            float dl = d * float(sc & 0xFu);
+            float ml = mn * float(sc >> 4);
+            for (uint l = 0u; l < 16u; l++) {
+                put(o, dl * float((byte_at(q + l) >> shift) & 3u) - ml);
+                o++;
+            }
+            sc = byte_at(off + is);
+            is++;
+            dl = d * float(sc & 0xFu);
+            ml = mn * float(sc >> 4);
+            for (uint l = 0u; l < 16u; l++) {
+                put(o, dl * float((byte_at(q + l + 16u) >> shift) & 3u) - ml);
+                o++;
+            }
+            shift += 2u;
+        }
+        q += 32u;
+    }
+}
+
+#elif defined(Q3_K)
+#define BLOCK 256u
+#define TYPE_SIZE 110u
+uint word_at(uint byte_offset) {
+    return half_at(byte_offset) | (half_at(byte_offset + 2u) << 16);
+}
+void dequant_block(uint off, uint o) {
+    float d = f16_at(off + 108u);
+    uint s = off + 96u;
+    uint aux0 = word_at(s), aux1 = word_at(s + 4u), tmp = word_at(s + 8u);
+    uint kmask1 = 0x03030303u, kmask2 = 0x0f0f0f0fu;
+    uint a[4];
+    a[2] = ((aux0 >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+    a[3] = ((aux1 >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+    a[0] = (aux0 & kmask2) | (((tmp >> 0) & kmask1) << 4);
+    a[1] = (aux1 & kmask2) | (((tmp >> 2) & kmask1) << 4);
+    uint q = off + 32u;
+    uint hm = off;
+    uint m = 1u;
+    uint is = 0u;
+    for (uint n = 0u; n < 2u; n++) {
+        uint shift = 0u;
+        for (uint j = 0u; j < 4u; j++) {
+            for (uint half_ = 0u; half_ < 2u; half_++) {
+                uint sc = (a[is >> 2] >> ((is & 3u) * 8u)) & 0xFFu;
+                is++;
+                float dl = d * (float(sc) - 32.0);
+                uint base = half_ * 16u;
+                for (uint l = 0u; l < 16u; l++) {
+                    float hv = ((byte_at(hm + base + l) & m) != 0u) ? 0.0 : 4.0;
+                    put(o, dl * (float((byte_at(q + base + l) >> shift) & 3u) - hv));
+                    o++;
+                }
+            }
+            shift += 2u;
+            m <<= 1;
+        }
+        q += 32u;
+    }
+}
+
+#elif defined(Q4_K) || defined(Q5_K)
+#define BLOCK 256u
+#if defined(Q4_K)
+#define TYPE_SIZE 144u
+#else
+#define TYPE_SIZE 176u
+#endif
+void scale_min(uint j, uint s, out float sc, out float m) {
+    uint a, b;
+    if (j < 4u) {
+        a = byte_at(s + j) & 63u;
+        b = byte_at(s + j + 4u) & 63u;
+    } else {
+        a = (byte_at(s + j + 4u) & 0xFu) | ((byte_at(s + j - 4u) >> 6) << 4);
+        b = (byte_at(s + j + 4u) >> 4) | ((byte_at(s + j) >> 6) << 4);
+    }
+    sc = float(a);
+    m = float(b);
+}
+void dequant_block(uint off, uint o) {
+    float d = f16_at(off);
+    float dmin = f16_at(off + 2u);
+    uint s = off + 4u;
+#if defined(Q4_K)
+    uint qs = off + 16u;
+#else
+    uint qh = off + 16u;
+    uint qs = off + 48u;
+#endif
+    for (uint i = 0u; i < 4u; i++) {
+        float sc1, m1, sc2, m2;
+        scale_min(2u * i, s, sc1, m1);
+        scale_min(2u * i + 1u, s, sc2, m2);
+        float d1 = d * sc1, mn1 = dmin * m1;
+        float d2 = d * sc2, mn2 = dmin * m2;
+#if defined(Q5_K)
+        uint u1 = 1u << (2u * i), u2 = 1u << (2u * i + 1u);
+#endif
+        for (uint l = 0u; l < 32u; l++) {
+            uint q = byte_at(qs + 32u * i + l);
+            float lo = float(q & 0xFu);
+            float hi = float(q >> 4);
+#if defined(Q5_K)
+            uint h = byte_at(qh + l);
+            lo += ((h & u1) != 0u) ? 16.0 : 0.0;
+            hi += ((h & u2) != 0u) ? 16.0 : 0.0;
+#endif
+            put(o + l, d1 * lo - mn1);
+            put(o + 32u + l, d2 * hi - mn2);
+        }
+        o += 64u;
+    }
+}
+
+#elif defined(Q6_K)
+#define BLOCK 256u
+#define TYPE_SIZE 210u
+void dequant_block(uint off, uint o) {
+    float d = f16_at(off + 208u);
+    for (uint n = 0u; n < 2u; n++) {
+        uint ql = off + 64u * n;
+        uint qh = off + 128u + 32u * n;
+        uint sc = off + 192u + 8u * n;
+        uint ob = o + 128u * n;
+        for (uint l = 0u; l < 32u; l++) {
+            uint is = l / 16u;
+            uint h = byte_at(qh + l);
+            uint q0 = byte_at(ql + l);
+            uint q32 = byte_at(ql + l + 32u);
+            int q1 = int((q0 & 0xFu) | (((h >> 0) & 3u) << 4)) - 32;
+            int q2 = int((q32 & 0xFu) | (((h >> 2) & 3u) << 4)) - 32;
+            int q3 = int((q0 >> 4) | (((h >> 4) & 3u) << 4)) - 32;
+            int q4 = int((q32 >> 4) | (((h >> 6) & 3u) << 4)) - 32;
+            put(ob + l, d * float(s8(byte_at(sc + is))) * float(q1));
+            put(ob + l + 32u, d * float(s8(byte_at(sc + is + 2u))) * float(q2));
+            put(ob + l + 64u, d * float(s8(byte_at(sc + is + 4u))) * float(q3));
+            put(ob + l + 96u, d * float(s8(byte_at(sc + is + 6u))) * float(q4));
+        }
+    }
+}
+
+#else
+#error "dequant.comp needs a quant type define"
+#endif
+
+void main() {
+    uint block = gl_GlobalInvocationID.x;
+    if (block >= pc.n_blocks) {
+        return;
+    }
+    dequant_block(pc.off_src + block * TYPE_SIZE, pc.off_dst + block * BLOCK);
+}
